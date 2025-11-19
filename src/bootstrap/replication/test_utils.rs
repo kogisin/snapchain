@@ -1,16 +1,19 @@
 #[cfg(test)]
-mod tests {
+pub mod replication_test_utils {
     use crate::{
-        proto,
-        replication::{
+        network::replication::{
             replication_stores::ReplicationStores,
-            replicator::{self, Replicator, ReplicatorSnapshotOptions},
+            replicator::{Replicator, ReplicatorSnapshotOptions},
+            ReplicationServer,
         },
+        proto,
         storage::{
             db::{RocksDB, RocksdbError},
             store::{
                 account::UserDataStore,
-                engine::{MempoolMessage, PostCommitMessage, ShardEngine},
+                block_engine::BlockEngine,
+                engine::{PostCommitMessage, ShardEngine},
+                mempool_poller::MempoolMessage,
                 test_helper::{self, EngineOptions},
             },
             trie::merkle_trie::TrieKey,
@@ -19,7 +22,7 @@ mod tests {
     };
     use std::{collections::HashMap, sync::Arc, time::Duration};
 
-    fn opendb(path: &str) -> Result<Arc<RocksDB>, RocksdbError> {
+    pub fn opendb(path: &str) -> Result<Arc<RocksDB>, RocksdbError> {
         let milliseconds_timestamp: u128 = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -30,7 +33,7 @@ mod tests {
         Ok(Arc::new(db))
     }
 
-    fn new_engine_with_fname_signer(
+    pub async fn new_engine_with_fname_signer(
         tmp: &tempfile::TempDir,
         post_commit_tx: Option<tokio::sync::mpsc::Sender<PostCommitMessage>>,
     ) -> (alloy_signer_local::PrivateKeySigner, ShardEngine) {
@@ -43,11 +46,12 @@ mod tests {
             fname_signer_address: Some(signer.address()),
             post_commit_tx,
             ..EngineOptions::default()
-        });
+        })
+        .await;
         (signer, engine)
     }
 
-    async fn commit_message(engine: &mut ShardEngine, message: &proto::Message) {
+    pub async fn commit_message(engine: &mut ShardEngine, message: &proto::Message) {
         let state_change = engine.propose_state_change(
             1,
             vec![MempoolMessage::UserMessage(message.clone())],
@@ -64,17 +68,20 @@ mod tests {
             state_change.new_state_root,
             chunk.header.as_ref().unwrap().shard_root
         );
-        assert!(engine.trie_key_exists(test_helper::trie_ctx(), &TrieKey::for_message(message)));
+
+        assert!(TrieKey::for_message(message)
+            .iter()
+            .all(|trie_key| engine.trie_key_exists(test_helper::trie_ctx(), trie_key)));
     }
 
-    async fn register_fid(engine: &mut ShardEngine, fid: u64) -> ed25519_dalek::SigningKey {
+    pub async fn register_fid(engine: &mut ShardEngine, fid: u64) -> ed25519_dalek::SigningKey {
         let signer = factory::signers::generate_signer();
         let address = factory::address::generate_random_address();
         test_helper::register_user(fid, signer.clone(), address, engine).await;
         signer
     }
 
-    fn has_fname(engine: &mut ShardEngine, fid: u64, fname: Option<&String>) -> bool {
+    pub fn has_fname(engine: &mut ShardEngine, fid: u64, fname: Option<&String>) -> bool {
         let result =
             UserDataStore::get_username_proof_by_fid(&engine.get_stores().user_data_store, fid);
         assert!(result.is_ok());
@@ -89,7 +96,7 @@ mod tests {
         }
     }
 
-    async fn register_fname(
+    pub async fn register_fname(
         engine: &mut ShardEngine,
         fname_signer: &alloy_signer_local::PrivateKeySigner,
         fid: u64,
@@ -120,7 +127,7 @@ mod tests {
         commit_message(engine, &username_message).await;
     }
 
-    async fn transfer_fname(
+    pub async fn transfer_fname(
         engine: &mut ShardEngine,
         fname_signer: &alloy_signer_local::PrivateKeySigner,
         fid: u64,
@@ -147,7 +154,7 @@ mod tests {
         assert!(has_fname(engine, new_fid, Some(fname)));
     }
 
-    async fn send_cast(
+    pub async fn send_cast(
         engine: &mut ShardEngine,
         fid: u64,
         signer: Option<&ed25519_dalek::SigningKey>,
@@ -159,7 +166,7 @@ mod tests {
         cast
     }
 
-    async fn like_cast(
+    pub async fn like_cast(
         engine: &mut ShardEngine,
         fid: u64,
         signer: Option<&ed25519_dalek::SigningKey>,
@@ -184,7 +191,7 @@ mod tests {
         like
     }
 
-    async fn set_bio(
+    pub async fn set_bio(
         engine: &mut ShardEngine,
         fid: u64,
         signer: Option<&ed25519_dalek::SigningKey>,
@@ -202,7 +209,7 @@ mod tests {
         user_data_add
     }
 
-    async fn create_link(
+    pub async fn create_link(
         engine: &mut ShardEngine,
         fid: u64,
         signer: Option<&ed25519_dalek::SigningKey>,
@@ -215,7 +222,7 @@ mod tests {
         link
     }
 
-    async fn create_compact_link(
+    pub async fn create_compact_link(
         engine: &mut ShardEngine,
         fid: u64,
         signer: Option<&ed25519_dalek::SigningKey>,
@@ -233,7 +240,12 @@ mod tests {
         link
     }
 
-    fn setup_replicator(engine: &mut ShardEngine) -> Arc<Replicator> {
+    pub fn setup_replicator(
+        engine: &mut ShardEngine,
+        block_engine: &mut BlockEngine,
+    ) -> (Arc<Replicator>, ReplicationServer) {
+        use crate::storage::store::block_engine_test_helpers::default_block;
+
         let statsd_client = crate::utils::statsd_wrapper::StatsdClientWrapper::new(
             cadence::StatsdClient::builder("", cadence::NopMetricSink {}).build(),
             true,
@@ -244,229 +256,27 @@ mod tests {
 
         let replication_stores = Arc::new(ReplicationStores::new(
             shard_stores.clone(),
-            16,
             statsd_client.clone(),
             engine.network.clone(),
         ));
 
         let replicator = Arc::new(Replicator::new_with_options(
             replication_stores.clone(),
+            statsd_client.clone(),
             ReplicatorSnapshotOptions {
                 interval: 1,
                 max_age: Duration::from_secs(10),
             },
         ));
 
-        replicator
-    }
+        let block_stores = block_engine.stores();
+        let block = default_block();
+        block_stores.block_store.put_block(&block).unwrap();
 
-    fn fetch_transactions(
-        replicator: &Arc<Replicator>,
-        shard_id: u32,
-        height: u64,
-        message_limit: usize,
-    ) -> Vec<proto::Transaction> {
-        let mut next_page_token = None;
-        let mut transactions = vec![];
+        // Set up the replication server with the given replicator
+        let replication_server =
+            ReplicationServer::new(replicator.clone(), block_stores, statsd_client);
 
-        loop {
-            let results = replicator.transactions_for_shard_and_height(
-                shard_id,
-                height,
-                next_page_token.clone(),
-                message_limit,
-            );
-
-            let (results, next_page) = match results {
-                Ok(res) => res,
-                Err(e) => {
-                    panic!(
-                        "Error fetching transactions for shard {} and height {}: {}",
-                        shard_id, height, e
-                    );
-                }
-            };
-
-            transactions.extend(results);
-            next_page_token = next_page;
-
-            if next_page_token.is_none() {
-                break;
-            }
-        }
-
-        transactions
-    }
-
-    fn replicate_engine(
-        source_engine: &ShardEngine,
-        dest_engine: &mut ShardEngine,
-        replicator: Arc<Replicator>,
-    ) {
-        let height = source_engine.get_confirmed_height().block_number;
-        let transactions = fetch_transactions(
-            &replicator,
-            source_engine.shard_id(),
-            height,
-            1, // intentionally using a small limit to exercise pagination
-        );
-
-        let mut synced_fids = HashMap::new();
-
-        for tx in &transactions {
-            synced_fids.insert(tx.fid, tx.account_root.clone());
-
-            // Replay the system and user transactions
-            dest_engine
-                .replay_transaction(tx)
-                .expect("Failed to replay transactions");
-        }
-
-        // Check the account roots match for both engines
-        for (fid, account_root_from_tx) in synced_fids {
-            let root1 = source_engine.account_root_for_fid(fid);
-            let root2 = dest_engine.account_root_for_fid(fid);
-
-            assert_eq!(
-                root1,
-                root2,
-                "Account roots do not match for fid {}, source root: {} vs replicated root: {}",
-                fid,
-                hex::encode(&root1),
-                hex::encode(&root2)
-            );
-
-            assert_eq!(
-                account_root_from_tx, root1,
-                "Account root from transaction does not match for fid {}",
-                fid
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn test_replication() {
-        // open tmp dir for database
-        let tmp_dir = tempfile::TempDir::new().unwrap();
-
-        let (post_commit_tx, post_commit_rx) = tokio::sync::mpsc::channel::<PostCommitMessage>(1);
-
-        let (signer, mut engine) = new_engine_with_fname_signer(&tmp_dir, Some(post_commit_tx)); // source engine
-        let (_, mut new_engine) = new_engine_with_fname_signer(&tmp_dir, None); // engine to replicate to
-
-        let replicator = setup_replicator(&mut engine);
-        let spawned_replicator = replicator.clone();
-        tokio::spawn(async move {
-            replicator::run(spawned_replicator, post_commit_rx).await;
-        });
-
-        // Note: we're using FID3_FOR_TEST here because the address verification message contains
-        // that FID.
-        let fid = test_helper::FID3_FOR_TEST;
-        let fid_signer = register_fid(&mut engine, fid).await;
-
-        let fid2 = 2000;
-        let fid2_signer = register_fid(&mut engine, fid2).await;
-
-        // Running timestamp
-        let mut timestamp = factory::time::farcaster_time();
-
-        timestamp += 1;
-
-        let fname = &"replica-test".to_string();
-
-        register_fname(
-            &mut engine,
-            &signer,
-            fid,
-            Some(&fid_signer),
-            fname,
-            Some(timestamp),
-        )
-        .await;
-
-        set_bio(
-            &mut engine,
-            fid2,
-            Some(&fid2_signer),
-            &"hello".to_string(),
-            Some(timestamp),
-        )
-        .await;
-
-        timestamp += 1;
-
-        transfer_fname(
-            &mut engine,
-            &signer,
-            fid,
-            Some(&fid_signer),
-            fid2,
-            fname,
-            Some(timestamp),
-        )
-        .await;
-
-        timestamp += 1;
-
-        let cast = send_cast(
-            &mut engine,
-            fid,
-            Some(&fid_signer),
-            "hello world",
-            Some(timestamp),
-        )
-        .await;
-
-        timestamp += 1;
-
-        create_link(&mut engine, fid, Some(&fid_signer), fid2, Some(timestamp)).await;
-        create_compact_link(
-            &mut engine,
-            fid2,
-            Some(&fid2_signer),
-            vec![fid],
-            Some(timestamp),
-        )
-        .await;
-        like_cast(
-            &mut engine,
-            fid2,
-            Some(&fid2_signer),
-            &cast,
-            Some(timestamp),
-        )
-        .await;
-
-        timestamp += 1;
-
-        // Note: has to use FID3_FOR_TEST
-        let address_verification_add = messages_factory::verifications::create_verification_add(
-            fid,
-            0,
-            hex::decode("91031dcfdea024b4d51e775486111d2b2a715871").unwrap(),
-            hex::decode("b72c63d61f075b36fb66a9a867b50836cef19d653a3c09005628738677bcb25f25b6b6e6d2e1d69cd725327b3c020deef9e2575a22dc8ed08f88bc75718ce1cb1c").unwrap(),
-            hex::decode("d74860c4bbf574d5ad60f03a478a30f990e05ac723e138a5c860cdb3095f4296").unwrap(),
-            Some(timestamp),
-            Some(&fid_signer),
-        );
-
-        commit_message(&mut engine, &address_verification_add).await;
-
-        timestamp += 1;
-
-        let username_proof_add = messages_factory::username_proof::create_username_proof(
-            fid,
-            proto::UserNameType::UsernameTypeEnsL1,
-            "username.eth".to_string().clone(),
-            hex::decode("91031dcfdea024b4d51e775486111d2b2a715871").unwrap(),
-            "signature".to_string(),
-            timestamp as u64,
-            Some(&fid_signer),
-        );
-
-        commit_message(&mut engine, &username_proof_add).await;
-
-        replicate_engine(&engine, &mut new_engine, replicator);
+        (replicator, replication_server)
     }
 }

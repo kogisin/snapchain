@@ -152,6 +152,8 @@ pub struct MessageData {
         skip_serializing_if = "Option::is_none"
     )]
     pub link_compact_state_body: Option<LinkCompactStateBody>,
+    #[serde(rename = "lendStorageBody", skip_serializing_if = "Option::is_none")]
+    pub lend_storage_body: Option<LendStorageBody>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -279,6 +281,16 @@ pub struct LinkCompactStateBody {
     pub link_compact_type: String,
     #[serde(rename = "targetFids")]
     pub target_fids: Vec<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LendStorageBody {
+    #[serde(rename = "toFid")]
+    pub to_fid: u64,
+    #[serde(rename = "numUnits")]
+    pub num_units: u64,
+    #[serde(rename = "unitType")]
+    pub unit_type: StorageUnitType,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -1206,6 +1218,7 @@ impl IdRegistryEventByAddressRequest {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ContactInfoBody {
     gossip_address: String,
+    announce_rpc_address: String,
     peer_id: String,
     snapchain_version: String,
     network: FarcasterNetwork,
@@ -1218,6 +1231,7 @@ impl TryFrom<proto::ContactInfoBody> for ContactInfoBody {
     fn try_from(value: proto::ContactInfoBody) -> Result<Self, Self::Error> {
         Ok(ContactInfoBody {
             gossip_address: value.gossip_address.clone(),
+            announce_rpc_address: value.announce_rpc_address.clone(),
             peer_id: PeerId::from_bytes(&value.peer_id)
                 .map_err(|err| ErrorResponse {
                     error: "Invalid peer id".to_string(),
@@ -1526,6 +1540,20 @@ fn map_proto_verification_remove_body_to_json_verification_remove_body(
     })
 }
 
+fn map_proto_lend_storage_body_to_json_lend_storage_body(
+    lend_storage_body: proto::LendStorageBody,
+) -> Result<LendStorageBody, ErrorResponse> {
+    Ok(LendStorageBody {
+        to_fid: lend_storage_body.to_fid,
+        num_units: lend_storage_body.num_units,
+        unit_type: match lend_storage_body.unit_type {
+            2 => StorageUnitType::UnitType2025,
+            1 => StorageUnitType::UnitType2024,
+            _ => StorageUnitType::UnitTypeLegacy,
+        },
+    })
+}
+
 fn map_proto_message_data_to_json_message_data(
     message_data: proto::MessageData,
 ) -> Result<MessageData, ErrorResponse> {
@@ -1559,6 +1587,7 @@ fn map_proto_message_data_to_json_message_data(
                 username_proof_body: None,
                 frame_action_body: None,
                 link_compact_state_body: None,
+                lend_storage_body: None,
             })
         }
         Some(Body::CastRemoveBody(cast_remove_body)) => Ok(MessageData {
@@ -1590,6 +1619,7 @@ fn map_proto_message_data_to_json_message_data(
             username_proof_body: None,
             frame_action_body: None,
             link_compact_state_body: None,
+            lend_storage_body: None,
         }),
         Some(Body::FrameActionBody(frame_action_body)) => {
             return Ok(MessageData {
@@ -1630,6 +1660,7 @@ fn map_proto_message_data_to_json_message_data(
                     address: frame_action_body.address,
                 }),
                 link_compact_state_body: None,
+                lend_storage_body: None,
             });
         }
         Some(Body::LinkBody(link_body)) => {
@@ -1661,6 +1692,7 @@ fn map_proto_message_data_to_json_message_data(
                 username_proof_body: None,
                 frame_action_body: None,
                 link_compact_state_body: None,
+                lend_storage_body: None,
             });
         }
         Some(Body::LinkCompactStateBody(link_compact_state_body)) => {
@@ -1692,6 +1724,7 @@ fn map_proto_message_data_to_json_message_data(
                 link_body: None,
                 username_proof_body: None,
                 frame_action_body: None,
+                lend_storage_body: None,
                 link_compact_state_body: Some(result),
             });
         }
@@ -1724,6 +1757,7 @@ fn map_proto_message_data_to_json_message_data(
                 username_proof_body: None,
                 frame_action_body: None,
                 link_compact_state_body: None,
+                lend_storage_body: None,
             });
         }
         Some(Body::UserDataBody(user_data_body)) => {
@@ -1755,6 +1789,7 @@ fn map_proto_message_data_to_json_message_data(
                 username_proof_body: None,
                 frame_action_body: None,
                 link_compact_state_body: None,
+                lend_storage_body: None,
             });
         }
         Some(Body::UsernameProofBody(username_proof_body)) => {
@@ -1787,6 +1822,7 @@ fn map_proto_message_data_to_json_message_data(
                 username_proof_body: Some(result),
                 frame_action_body: None,
                 link_compact_state_body: None,
+                lend_storage_body: None,
             });
         }
         Some(Body::VerificationAddAddressBody(verification_add_address_body)) => {
@@ -1820,6 +1856,7 @@ fn map_proto_message_data_to_json_message_data(
                 username_proof_body: None,
                 frame_action_body: None,
                 link_compact_state_body: None,
+                lend_storage_body: None,
             });
         }
         Some(Body::VerificationRemoveBody(verification_remove_body)) => {
@@ -1853,6 +1890,39 @@ fn map_proto_message_data_to_json_message_data(
                 username_proof_body: None,
                 frame_action_body: None,
                 link_compact_state_body: None,
+                lend_storage_body: None,
+            });
+        }
+        Some(Body::LendStorageBody(lend_storage_body)) => {
+            let result = map_proto_lend_storage_body_to_json_lend_storage_body(lend_storage_body)?;
+            return Ok(MessageData {
+                message_type: MessageType::try_from(message_data.r#type)
+                    .map_err(|_| ErrorResponse {
+                        error: "Invalid message type".to_string(),
+                        error_detail: None,
+                    })?
+                    .as_str_name()
+                    .to_owned(),
+                fid: message_data.fid,
+                network: FarcasterNetwork::try_from(message_data.network)
+                    .map_err(|_| ErrorResponse {
+                        error: "Invalid network".to_string(),
+                        error_detail: None,
+                    })?
+                    .as_str_name()
+                    .to_owned(),
+                timestamp: message_data.timestamp,
+                cast_add_body: None,
+                cast_remove_body: None,
+                reaction_body: None,
+                verification_add_address_body: None,
+                verification_remove_body: None,
+                user_data_body: None,
+                link_body: None,
+                username_proof_body: None,
+                frame_action_body: None,
+                link_compact_state_body: None,
+                lend_storage_body: Some(result),
             });
         }
         None => Err(ErrorResponse {

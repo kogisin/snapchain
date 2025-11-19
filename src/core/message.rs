@@ -1,4 +1,5 @@
 use crate::core::error::HubError;
+use crate::core::types::{Shardable, SnapchainValidatorContext};
 use crate::proto;
 use crate::proto::{consensus_message, ConsensusMessage, HubEvent, MessageType};
 use crate::storage::store::engine::MessageValidationError;
@@ -26,20 +27,6 @@ impl proto::Message {
 
     pub fn hex_hash(&self) -> String {
         hex::encode(&self.hash)
-    }
-}
-
-impl proto::ValidatorMessage {
-    pub fn fid(&self) -> u64 {
-        if let Some(fname) = &self.fname_transfer {
-            if let Some(proof) = &fname.proof {
-                return proof.fid;
-            }
-        }
-        if let Some(event) = &self.on_chain_event {
-            return event.fid;
-        }
-        0
     }
 }
 
@@ -100,5 +87,29 @@ impl proto::HubEvent {
                 reason: merge_error.message,
             }),
         )
+    }
+}
+
+impl Shardable for informalsystems_malachitebft_sync::Request<SnapchainValidatorContext> {
+    fn shard_id(&self) -> u32 {
+        match self {
+            informalsystems_malachitebft_sync::Request::ValueRequest(req) => req.height.shard_index,
+            informalsystems_malachitebft_sync::Request::VoteSetRequest(req) => {
+                req.height.shard_index
+            }
+        }
+    }
+}
+
+impl Shardable for informalsystems_malachitebft_sync::Response<SnapchainValidatorContext> {
+    fn shard_id(&self) -> u32 {
+        match self {
+            informalsystems_malachitebft_sync::Response::ValueResponse(resp) => {
+                resp.height.shard_index
+            }
+            informalsystems_malachitebft_sync::Response::VoteSetResponse(resp) => {
+                resp.height.shard_index
+            }
+        }
     }
 }

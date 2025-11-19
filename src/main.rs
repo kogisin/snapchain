@@ -5,24 +5,25 @@ use informalsystems_malachitebft_metrics::{Metrics, SharedRegistry};
 use snapchain::connectors::fname::FnameRequest;
 use snapchain::connectors::onchain_events::{ChainClients, OnchainEventsRequest};
 use snapchain::consensus::consensus::SystemMessage;
+use snapchain::mempool::block_receiver::BlockReceiver;
 use snapchain::mempool::mempool::{Mempool, MempoolRequest, ReadNodeMempool};
 use snapchain::mempool::routing;
 use snapchain::network::admin_server::MyAdminService;
 use snapchain::network::gossip::{GossipEvent, SnapchainGossip};
 use snapchain::network::http_server::HubHttpServiceImpl;
+use snapchain::network::replication::{self, ReplicationServer, Replicator};
 use snapchain::network::server::MyHubService;
 use snapchain::node::snapchain_node::SnapchainNode;
 use snapchain::node::snapchain_read_node::SnapchainReadNode;
 use snapchain::proto::admin_service_server::AdminServiceServer;
 use snapchain::proto::hub_service_server::HubServiceServer;
 use snapchain::proto::replication_service_server::ReplicationServiceServer;
-use snapchain::replication;
-use snapchain::storage::db::snapshot::download_snapshots;
+use snapchain::storage::db::snapshot::{download_snapshots, BootstrapMethod};
 use snapchain::storage::db::RocksDB;
+use snapchain::storage::store::block_engine::BlockStores;
 use snapchain::storage::store::engine::{PostCommitMessage, Senders};
 use snapchain::storage::store::node_local_state::{self, LocalStateStore};
 use snapchain::storage::store::stores::Stores;
-use snapchain::storage::store::BlockStore;
 use snapchain::utils::statsd_wrapper::StatsdClientWrapper;
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
@@ -51,9 +52,10 @@ async fn start_servers(
     statsd_client: StatsdClientWrapper,
     shard_stores: HashMap<u32, Stores>,
     shard_senders: HashMap<u32, Senders>,
-    block_store: BlockStore,
+    block_stores: BlockStores,
     chain_clients: ChainClients,
     replicator: Option<Arc<replication::replicator::Replicator>>,
+    local_state_store: LocalStateStore,
 ) {
     let grpc_addr = app_config.rpc_address.clone();
     let grpc_socket_addr: SocketAddr = grpc_addr.parse().unwrap();
@@ -64,15 +66,16 @@ async fn start_servers(
         onchain_events_request_tx,
         fname_request_tx,
         shard_stores.clone(),
-        block_store.clone(),
+        block_stores.clone(),
         app_config.snapshot.clone(),
         app_config.fc_network,
         statsd_client.clone(),
+        local_state_store,
     );
 
     let service = Arc::new(MyHubService::new(
         app_config.rpc_auth.clone(),
-        block_store.clone(),
+        block_stores.clone(),
         shard_stores.clone(),
         shard_senders,
         statsd_client.clone(),
@@ -87,12 +90,11 @@ async fn start_servers(
     ));
 
     let replication_service = if let Some(replicator) = replicator {
-        let server = replication::replication_server::ReplicationServer::new(
+        let service = ReplicationServiceServer::new(ReplicationServer::new(
             replicator,
-            Box::new(routing::ShardRouter {}),
-            app_config.consensus.num_shards,
-        );
-        let service = ReplicationServiceServer::new(server);
+            block_stores.clone(),
+            statsd_client.clone(),
+        ));
         Some(service)
     } else {
         None
@@ -176,8 +178,8 @@ async fn start_servers(
 
 async fn schedule_background_jobs(
     app_config: &snapchain::cfg::Config,
-    block_store: BlockStore,
     shard_stores: HashMap<u32, Stores>,
+    block_stores: BlockStores,
     sync_complete_rx: watch::Receiver<bool>,
     statsd_client: StatsdClientWrapper,
 ) {
@@ -189,7 +191,7 @@ async fn schedule_background_jobs(
             let job = snapchain::jobs::block_pruning::block_pruning_job(
                 schedule,
                 block_retention,
-                block_store.clone(),
+                block_stores.clone(),
                 shard_stores.clone(),
                 sync_complete_rx,
             )
@@ -211,8 +213,8 @@ async fn schedule_background_jobs(
             "0 0 5 * * *", // 5 AM UTC every day
             app_config.snapshot.clone(),
             app_config.fc_network,
-            block_store,
-            shard_stores,
+            block_stores.clone(),
+            shard_stores.clone(),
             statsd_client,
         )
         .unwrap();
@@ -235,23 +237,38 @@ fn create_replicator(
     app_config: &snapchain::cfg::Config,
     shard_stores: HashMap<u32, Stores>,
     statsd_client: StatsdClientWrapper,
-) -> Arc<replication::Replicator> {
+) -> Result<Arc<replication::Replicator>, Box<dyn Error>> {
+    let soft_limit = Replicator::ensure_ulimit();
+    if soft_limit < Replicator::ULIMIT_MIN {
+        error!("The current file descriptor limit ({}) is too low to start the replicator. Replicator will be disabled", soft_limit);
+        return Err(format!("File descriptor limit too low: {}", soft_limit).into());
+    }
+
+    if soft_limit < Replicator::ULIMIT_RECOMMENDED {
+        warn!("The current file descriptor limit ({}) is too low. Please set it to at > {} to ensure stable operation of the replicator", soft_limit, Replicator::ULIMIT_RECOMMENDED);
+    }
+
+    info!(
+        "Starting replicator with file descriptor limit: {}",
+        soft_limit
+    );
+
     let replication_stores = Arc::new(replication::ReplicationStores::new(
         shard_stores,
-        app_config.trie_branching_factor,
-        statsd_client,
+        statsd_client.clone(),
         app_config.fc_network.clone(),
     ));
     let replicator = replication::Replicator::new_with_options(
         replication_stores,
+        statsd_client,
         replication::ReplicatorSnapshotOptions {
             interval: app_config.replication.snapshot_interval,
             max_age: app_config.replication.snapshot_max_age,
         },
     );
-    Arc::new(replicator)
-}
 
+    Ok(Arc::new(replicator))
+}
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     let args: Vec<String> = std::env::args().collect();
@@ -293,27 +310,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
     }
 
-    // We only use snapshots if the db directory doesn't exist or is empty.
-    // If the user sets [force_load_db_from_snapshot], load the snapshot without checking directory contents.
-    if app_config.snapshot.force_load_db_from_snapshot
-        || (app_config.snapshot.load_db_from_snapshot
-            && (!fs::exists(app_config.rocksdb_dir.clone()).unwrap()
-                || is_dir_empty(&app_config.rocksdb_dir).unwrap()))
-    {
-        info!("Downloading snapshots");
-        let mut shard_ids = app_config.consensus.shard_ids.clone();
-        shard_ids.push(0);
-        // Raise if the download fails. If there's a persistent issue, disable snapshot download.
-        download_snapshots(
-            app_config.fc_network,
-            &app_config.snapshot,
-            app_config.rocksdb_dir.clone(),
-            shard_ids,
-        )
-        .await
-        .unwrap();
-    };
-
     if app_config.statsd.prefix == "" {
         // TODO: consider removing this check
         return Err("statsd prefix must be specified in config".into());
@@ -339,12 +335,83 @@ async fn main() -> Result<(), Box<dyn Error>> {
         cadence::StatsdClient::builder(app_config.statsd.prefix.as_str(), sink).build();
     let statsd_client = StatsdClientWrapper::new(statsd_client, app_config.statsd.use_tags);
 
-    let block_db = RocksDB::open_shard_db(app_config.rocksdb_dir.as_str(), 0);
-    let block_store = BlockStore::new(block_db);
-    info!(
-        "Block db height {}",
-        block_store.max_block_number().unwrap()
-    );
+    // We only use snapshots if the db directory doesn't exist or is empty.
+    // If the user sets [force_load_db_from_snapshot], load the snapshot without checking directory contents.
+    let db_is_empty = !fs::exists(app_config.rocksdb_dir.clone()).unwrap()
+        || is_dir_empty(&app_config.rocksdb_dir).unwrap();
+
+    if db_is_empty {
+        match app_config.snapshot.bootstrap_method {
+            BootstrapMethod::Replicate => {
+                // use snapchain::bootstrap::replication::service::{
+                //     ReplicatorBootstrap, WorkUnitResponse,
+                // };
+                // use tokio::time::{sleep, Duration};
+                // use rustls::crypto::{self, ring};
+
+                // // Initialize SSL for rustls
+                // crypto::CryptoProvider::install_default(ring::default_provider())
+                //     .expect("Failed to install rustls crypto provider");
+
+                // info!("Starting node with replication bootstrap");
+                // let replicator = ReplicatorBootstrap::new(statsd_client.clone(), &app_config);
+
+                // match replicator.bootstrap_using_replication().await {
+                //     Ok(r) => {
+                //         // Check for the specific success response
+                //         if r == WorkUnitResponse::Finished {
+                //             info!("Bootstrap using replication was successful. Will start snapchain now...");
+                //             // Sleep for 5 seconds to allow any pending logs to be flushed and the gossip to shutdown and free the port
+                //             sleep(Duration::from_secs(5)).await;
+                //         } else {
+                //             error!(
+                //                 "Replication bootstrap stopped with status: {:?}. Exiting.",
+                //                 r
+                //             );
+                //             process::exit(1);
+                //         }
+                //     }
+                //     Err(e) => {
+                //         error!("Replication bootstrap failed:\n{}\nPlease check your network connection and restart to resume.", e);
+                //         process::exit(1);
+                //     }
+                // }
+                error!("Bootstraup via Replication is not yet active");
+                process::exit(1);
+            }
+            BootstrapMethod::Snapshot => {
+                if app_config.snapshot.force_load_db_from_snapshot
+                    || app_config.snapshot.load_db_from_snapshot
+                {
+                    info!("Downloading snapshots (legacy method)");
+                    let mut shard_ids = app_config.consensus.shard_ids.clone();
+                    shard_ids.push(0);
+                    // Raise if the download fails. If there's a persistent issue, disable snapshot download.
+                    download_snapshots(
+                        app_config.fc_network,
+                        &app_config.snapshot,
+                        app_config.rocksdb_dir.clone(),
+                        shard_ids,
+                    )
+                    .await
+                    .unwrap();
+                }
+            }
+        }
+    } else if app_config.snapshot.force_load_db_from_snapshot {
+        // Force snapshot load even if DB exists
+        info!("Force downloading snapshots");
+        let mut shard_ids = app_config.consensus.shard_ids.clone();
+        shard_ids.push(0);
+        download_snapshots(
+            app_config.fc_network,
+            &app_config.snapshot,
+            app_config.rocksdb_dir.clone(),
+            shard_ids,
+        )
+        .await
+        .unwrap();
+    };
 
     let keypair = app_config.consensus.keypair().clone();
 
@@ -354,7 +421,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let gossip_result = SnapchainGossip::create(
         keypair.clone(),
         &app_config.gossip,
-        system_tx.clone(),
+        Some(system_tx.clone()),
         app_config.read_node,
         app_config.fc_network,
         statsd_client.clone(),
@@ -396,6 +463,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let (onchain_events_request_tx, onchain_events_request_rx) = broadcast::channel(100);
     let (fname_request_tx, fname_request_rx) = broadcast::channel(100);
 
+    let global_db = RocksDB::open_global_db(&app_config.rocksdb_dir);
+    let local_state_store = LocalStateStore::new(global_db);
+
     if app_config.read_node {
         // Setup post-commit channel if replication is enabled
         let (engine_post_commit_tx, engine_post_commit_rx) = if app_config.replication.enable {
@@ -412,10 +482,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
             local_peer_id,
             gossip_tx.clone(),
             system_tx.clone(),
-            block_store.clone(),
             app_config.rocksdb_dir.clone(),
             statsd_client.clone(),
-            app_config.trie_branching_factor,
             app_config.fc_network,
             registry,
             engine_post_commit_tx,
@@ -424,8 +492,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
         schedule_background_jobs(
             &app_config,
-            block_store.clone(),
             node.shard_stores.clone(),
+            node.block_stores.clone(),
             sync_complete_rx,
             statsd_client.clone(),
         )
@@ -435,8 +503,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
             mempool_rx,
             app_config.consensus.num_shards,
             node.shard_stores.clone(),
+            node.block_stores.clone(),
             gossip_tx.clone(),
             statsd_client.clone(),
+            app_config.fc_network,
         );
         tokio::spawn(async move { mempool.run().await });
 
@@ -448,13 +518,23 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 statsd_client.clone(),
             );
 
-            let spawned_replicator = replicator.clone();
-            tokio::spawn(async move {
-                replication::replicator::run(spawned_replicator, engine_post_commit_rx.unwrap())
-                    .await;
-            });
-
-            Some(replicator.clone())
+            match replicator {
+                Ok(replicator) => {
+                    let spawned_replicator = replicator.clone();
+                    tokio::spawn(async move {
+                        replication::replicator::run(
+                            spawned_replicator,
+                            engine_post_commit_rx.unwrap(),
+                        )
+                        .await;
+                    });
+                    Some(replicator)
+                }
+                Err(e) => {
+                    error!("Could not create replicator: {}", e);
+                    None
+                }
+            }
         } else {
             None
         };
@@ -469,9 +549,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
             statsd_client,
             node.shard_stores.clone(),
             node.shard_senders.clone(),
-            block_store.clone(),
+            node.block_stores.clone(),
             chains_clients,
             replicator,
+            local_state_store.clone(),
         )
         .await;
 
@@ -509,6 +590,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                 }
                             }
                         }
+                        SystemMessage::BlockRequest {block_event_seqnum: _ , block_tx: _ } => {},
                         SystemMessage::MalachiteNetwork(shard, event) => {
                             // Forward to appropriate consensus actors
                             node.dispatch_network_event(shard, event);
@@ -529,6 +611,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
     } else {
         let (shard_decision_tx, shard_decision_rx) = broadcast::channel(100);
 
+        let (block_tx, block_rx) = broadcast::channel(1000);
+
         // Setup post-commit channel if replication is enabled
         let (engine_post_commit_tx, engine_post_commit_rx) = if app_config.replication.enable {
             // TODO: consider increasing the buffer size to prevent blocking across multiple shards
@@ -538,22 +622,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
             (None, None)
         };
 
-        let global_db = RocksDB::open_global_db(&app_config.rocksdb_dir);
-        let local_state_store = LocalStateStore::new(global_db);
-
         let node = SnapchainNode::create(
             keypair.clone(),
             app_config.consensus.clone(),
             local_peer_id,
             gossip_tx.clone(),
             shard_decision_tx,
-            None,
+            Some(block_tx.clone()),
             messages_request_tx,
-            block_store.clone(),
             local_state_store.clone(),
             app_config.rocksdb_dir.clone(),
             statsd_client.clone(),
-            app_config.trie_branching_factor,
             app_config.fc_network,
             registry,
             engine_post_commit_tx,
@@ -562,8 +641,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
         schedule_background_jobs(
             &app_config,
-            block_store.clone(),
             node.shard_stores.clone(),
+            node.block_stores.clone(),
             sync_complete_rx,
             statsd_client.clone(),
         )
@@ -576,8 +655,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
             messages_request_rx,
             app_config.consensus.num_shards,
             node.shard_stores.clone(),
+            node.block_stores.clone(),
             gossip_tx.clone(),
             shard_decision_rx,
+            block_rx,
             statsd_client.clone(),
         );
         tokio::spawn(async move { mempool.run().await });
@@ -624,7 +705,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     node_local_state::Chain::Base,
                     mempool_tx.clone(),
                     statsd_client.clone(),
-                    local_state_store,
+                    local_state_store.clone(),
                     onchain_events_request_tx.subscribe(),
                 )?;
             tokio::spawn(async move {
@@ -646,16 +727,43 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 statsd_client.clone(),
             );
 
-            let spawned_replicator = replicator.clone();
-            tokio::spawn(async move {
-                replication::replicator::run(spawned_replicator, engine_post_commit_rx.unwrap())
-                    .await;
-            });
-
-            Some(replicator.clone())
+            match replicator {
+                Ok(replicator) => {
+                    let spawned_replicator = replicator.clone();
+                    tokio::spawn(async move {
+                        replication::replicator::run(
+                            spawned_replicator,
+                            engine_post_commit_rx.unwrap(),
+                        )
+                        .await;
+                    });
+                    Some(replicator)
+                }
+                Err(e) => {
+                    error!("Could not create replicator: {}", e);
+                    None
+                }
+            }
         } else {
             None
         };
+
+        if app_config.block_receiver.enabled {
+            for shard_id in app_config.consensus.shard_ids.iter() {
+                let senders = node.shard_senders.get(shard_id).unwrap();
+                let mut block_receiver = BlockReceiver {
+                    shard_id: *shard_id,
+                    stores: node.shard_stores.get(shard_id).unwrap().clone(),
+                    block_rx: block_tx.subscribe(),
+                    mempool_tx: mempool_tx.clone(),
+                    system_tx: system_tx.clone(),
+                    event_rx: senders.events_tx.subscribe(),
+                    validator_sets: app_config.consensus.to_stored_validator_sets(*shard_id),
+                    config: app_config.block_receiver.clone(),
+                };
+                tokio::spawn(async move { block_receiver.run().await });
+            }
+        }
 
         start_servers(
             &app_config,
@@ -667,18 +775,19 @@ async fn main() -> Result<(), Box<dyn Error>> {
             statsd_client,
             node.shard_stores.clone(),
             node.shard_senders.clone(),
-            block_store.clone(),
+            node.block_stores.clone(),
             chains_clients,
             replicator,
+            local_state_store.clone(),
         )
         .await;
 
         // TODO(aditi): We may want to reconsider this code when we upload snapshots on a schedule.
         if app_config.snapshot.backup_on_startup {
             let shard_ids = app_config.consensus.shard_ids.clone();
-            let block_db = block_store.db.clone();
+            let block_stores = node.block_stores.clone();
             let mut dbs = HashMap::new();
-            dbs.insert(0, block_db.clone());
+            dbs.insert(0, block_stores.db.clone());
             node.shard_stores
                 .iter()
                 .for_each(|(shard_id, shard_store)| {
@@ -726,6 +835,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             if let Err(e) = res {
                                 warn!("Failed to add to local mempool: {:?}", e);
                             }
+                        },
+                        SystemMessage::BlockRequest {block_event_seqnum, block_tx } => {
+                            let block= node.block_stores.get_block_by_event_seqnum(block_event_seqnum);
+                            block_tx.send(block).unwrap();
                         },
                         SystemMessage::DecidedValueForReadNode(_) => {
                             // Ignore these for validator nodes

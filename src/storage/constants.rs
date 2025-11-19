@@ -15,8 +15,9 @@ pub enum RootPrefix {
     /* Used to index reactions by target  */
     ReactionsByTarget = 7,
 
-    /* Sync Merkle Trie Node */
-    SyncMerkleTrieNode = 8,
+    /* Merkle Trie Node */
+    MerkleTrieNode = 8,
+
     /* Event log */
     HubEvents = 9,
     // /* The network ID that the rocksDB was created with */
@@ -27,8 +28,8 @@ pub enum RootPrefix {
 
     // /* Used to store on chain events */
     OnChainEvent = 12,
-    // /** DB Schema version */
-    // DBSchemaVersion = 13,
+    // /** DB Schema version used to manage migrations */
+    DBSchemaVersion = 13,
 
     // /* Used to index verifications by address */
     VerificationByAddress = 14,
@@ -44,6 +45,17 @@ pub enum RootPrefix {
 
     /* Used to index blocks by timestamp */
     BlockIndex = 18,
+
+    /* Used to index blocks events by seqnum */
+    BlockEvent = 19,
+
+    /* Merkle Trie Metadata. Reserved, not used right now */
+    MerkleTrieMetadata = 20,
+
+    /* Replication Bootstrap status */
+    ReplicationBootstrapStatus = 21,
+
+    LendStorageByRecipient = 22,
 }
 
 /** Copied from the JS code */
@@ -58,6 +70,7 @@ pub enum UserPostfix {
     // SignerMessage = 5,
     UserDataMessage = 6,
     UsernameProofMessage = 7,
+    LendStorageMessage = 8,
 
     // Add new message types here
     // NOTE: If you add a new message type, make sure that it is only used to store Message protobufs.
@@ -94,6 +107,8 @@ pub enum UserPostfix {
 
     /* Link Compact State set */
     LinkCompactStateMessage = 100,
+
+    LendStorages = 101,
 }
 
 impl UserPostfix {

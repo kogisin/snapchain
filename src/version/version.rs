@@ -3,7 +3,7 @@ use crate::proto::FarcasterNetwork;
 use strum::IntoEnumIterator;
 use strum_macros::EnumIter;
 
-const LATEST_PROTOCOL_VERSION: u32 = 4;
+const LATEST_PROTOCOL_VERSION: u32 = 9;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Ord, PartialOrd, EnumIter)]
 pub enum EngineVersion {
@@ -15,6 +15,13 @@ pub enum EngineVersion {
     V5 = 5,
     V6 = 6,
     V7 = 7,
+    V8 = 8,
+    V9 = 9,
+    V10 = 10,
+    V11 = 11,
+    V12 = 12,
+    V13 = 13,
+    V14 = 14,
 }
 
 pub enum ProtocolFeature {
@@ -27,6 +34,14 @@ pub enum ProtocolFeature {
     UsernameShardRoutingFix,
     FutureTimestampValidation,
     DependentMessagesInBulkSubmit,
+    DecoupleShardZeroBlockProduction,
+    WriteDataToShardZero,
+    ReadDataFromShardZero,
+    UserProfileToken,
+    StorageLending,
+    EventIdBugFix,
+    StorageLendingLimitFix,
+    StopRevokingExistingMessages,
 }
 
 pub struct VersionSchedule {
@@ -64,8 +79,36 @@ const ENGINE_VERSION_SCHEDULE_MAINNET: &[VersionSchedule] = [
         version: EngineVersion::V6,
     },
     VersionSchedule {
-        active_at: 1756141200, // 2026-08-25 5PM UTC
+        active_at: 1756141200, // 2025-08-25 5PM UTC
         version: EngineVersion::V7,
+    },
+    VersionSchedule {
+        active_at: 1756918800, // 2025-09-03 5PM UTC
+        version: EngineVersion::V8,
+    },
+    VersionSchedule {
+        active_at: 1757523600, // 2025-09-10 5PM UTC
+        version: EngineVersion::V9,
+    },
+    VersionSchedule {
+        active_at: 1758733200, // 2025-09-24 5PM UTC
+        version: EngineVersion::V10,
+    },
+    VersionSchedule {
+        active_at: 1759942800, // 2025-10-08 5PM UTC
+        version: EngineVersion::V11,
+    },
+    VersionSchedule {
+        active_at: 1759942800, // 2025-10-08 5PM UTC, fixes testnet issue
+        version: EngineVersion::V12,
+    },
+    VersionSchedule {
+        active_at: 1759942800, // 2025-10-08 5PM UTC, fixes testnet issue
+        version: EngineVersion::V13,
+    },
+    VersionSchedule {
+        active_at: 1761757200, // 2025-10-29 5PM UTC
+        version: EngineVersion::V14,
     },
 ]
 .as_slice();
@@ -84,15 +127,43 @@ const ENGINE_VERSION_SCHEDULE_TESTNET: &[VersionSchedule] = [
         version: EngineVersion::V6,
     },
     VersionSchedule {
-        active_at: 1756141200, // 2026-08-25 5PM UTC
+        active_at: 1755291600, // 2025-08-15 9PM UTC
         version: EngineVersion::V7,
+    },
+    VersionSchedule {
+        active_at: 1755709200, // 2025-08-20 5PM UTC
+        version: EngineVersion::V8,
+    },
+    VersionSchedule {
+        active_at: 1756918800, // 2025-09-03 5PM UTC
+        version: EngineVersion::V9,
+    },
+    VersionSchedule {
+        active_at: 1757523600, // 2025-09-10 5PM UTC
+        version: EngineVersion::V10,
+    },
+    VersionSchedule {
+        active_at: 1758733200, // 2025-09-24 5PM UTC
+        version: EngineVersion::V11,
+    },
+    VersionSchedule {
+        active_at: 1758763200, // 2025-09-25 1:20AM UTC, block engine event id fix
+        version: EngineVersion::V12,
+    },
+    VersionSchedule {
+        active_at: 1758906000, // 2025-09-26 5PM UTC, storage lending allowance limit fix
+        version: EngineVersion::V13,
+    },
+    VersionSchedule {
+        active_at: 1761152400, // 2025-10-22 5PM UTC
+        version: EngineVersion::V14,
     },
 ]
 .as_slice();
 
 const ENGINE_VERSION_SCHEDULE_DEVNET: &[VersionSchedule] = [VersionSchedule {
     active_at: 0,
-    version: EngineVersion::V7,
+    version: EngineVersion::V14,
 }]
 .as_slice();
 
@@ -134,6 +205,15 @@ impl EngineVersion {
             | ProtocolFeature::PrimaryAddresses => self >= &EngineVersion::V5,
             ProtocolFeature::FutureTimestampValidation => self >= &EngineVersion::V6,
             ProtocolFeature::DependentMessagesInBulkSubmit => self >= &EngineVersion::V7,
+            ProtocolFeature::DecoupleShardZeroBlockProduction => self >= &EngineVersion::V8,
+            ProtocolFeature::WriteDataToShardZero => self >= &EngineVersion::V9,
+            ProtocolFeature::ReadDataFromShardZero | ProtocolFeature::UserProfileToken => {
+                self >= &EngineVersion::V10
+            }
+            ProtocolFeature::StorageLending => self >= &EngineVersion::V11,
+            ProtocolFeature::EventIdBugFix => self >= &EngineVersion::V12,
+            ProtocolFeature::StorageLendingLimitFix => self >= &EngineVersion::V13,
+            ProtocolFeature::StopRevokingExistingMessages => self >= &EngineVersion::V14,
         }
     }
 
@@ -146,7 +226,12 @@ impl EngineVersion {
             | EngineVersion::V4 => 1,
             EngineVersion::V5 => 2,
             EngineVersion::V6 => 3,
-            EngineVersion::V7 => LATEST_PROTOCOL_VERSION,
+            EngineVersion::V7 => 4,
+            EngineVersion::V8 => 5,
+            EngineVersion::V9 => 6,
+            EngineVersion::V10 => 7,
+            EngineVersion::V11 | EngineVersion::V12 | EngineVersion::V13 => 8,
+            EngineVersion::V14 => LATEST_PROTOCOL_VERSION,
         }
     }
 
@@ -211,7 +296,7 @@ mod version_test {
                 previous_version.version
             );
             assert!(
-                current_version.active_at > previous_version.active_at,
+                current_version.active_at >= previous_version.active_at,
                 "Active time {:?} should be greater than {:?}",
                 current_version.active_at,
                 previous_version.active_at
@@ -316,7 +401,7 @@ mod version_test {
 
     #[test]
     fn test_latest() {
-        assert_eq!(EngineVersion::latest(), EngineVersion::V7);
+        assert_eq!(EngineVersion::latest(), EngineVersion::V14);
         assert_eq!(
             EngineVersion::version_for(&FarcasterTime::current(), FarcasterNetwork::Devnet),
             EngineVersion::latest()
@@ -341,7 +426,7 @@ mod version_test {
             Some(1747352400)
         );
 
-        let time = FarcasterTime::from_unix_seconds(1756141200);
+        let time = FarcasterTime::from_unix_seconds(1761757200);
         assert_eq!(
             EngineVersion::next_version_timestamp_for(&time, FarcasterNetwork::Mainnet),
             None

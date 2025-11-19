@@ -15,11 +15,12 @@ mod tests {
         },
     };
 
-    fn setup(limits: Limits) -> (ShardEngine, HashMap<u32, Stores>) {
+    async fn setup(limits: Limits) -> (ShardEngine, HashMap<u32, Stores>) {
         let (engine, _tmpdir) = test_helper::new_engine_with_options(EngineOptions {
             limits: Some(StoreLimits::new(limits.clone(), limits, limits::zero())),
             ..Default::default()
-        });
+        })
+        .await;
         let mut shard_stores = HashMap::new();
         shard_stores.insert(engine.shard_id(), engine.get_stores());
         return (engine, shard_stores);
@@ -35,7 +36,9 @@ mod tests {
             user_data: 10000,
             user_name_proofs: 10000,
             verifications: 10000,
-        });
+            storage_lends: 10000,
+        })
+        .await;
 
         register_user(
             FID_FOR_TEST,
@@ -52,17 +55,18 @@ mod tests {
                 max_capacity: 10,
             },
             statsd_client(),
+            1,
         );
 
-        for _ in 0..6000 {
-            assert!(rate_limits.consume_for_fid(engine.shard_id(), FID_FOR_TEST))
+        for _ in 0..7000 {
+            assert!(rate_limits.consume_for_fid(FID_FOR_TEST))
         }
 
-        assert!(!rate_limits.consume_for_fid(engine.shard_id(), FID_FOR_TEST));
+        assert!(!rate_limits.consume_for_fid(FID_FOR_TEST));
 
         sleep(Duration::from_millis(1500)).await;
 
-        assert!(rate_limits.consume_for_fid(engine.shard_id(), FID_FOR_TEST));
+        assert!(rate_limits.consume_for_fid(FID_FOR_TEST));
     }
 
     #[tokio::test]
@@ -74,7 +78,9 @@ mod tests {
             user_data: 1000,
             user_name_proofs: 1000,
             verifications: 1000,
-        });
+            storage_lends: 1000,
+        })
+        .await;
 
         register_user(
             FID_FOR_TEST,
@@ -91,18 +97,19 @@ mod tests {
                 max_capacity: 10,
             },
             statsd_client(),
+            1,
         );
 
-        for _ in 0..600 {
-            assert!(rate_limits.consume_for_fid(engine.shard_id(), FID_FOR_TEST))
+        for _ in 0..700 {
+            assert!(rate_limits.consume_for_fid(FID_FOR_TEST))
         }
 
-        assert!(!rate_limits.consume_for_fid(engine.shard_id(), FID_FOR_TEST));
+        assert!(!rate_limits.consume_for_fid(FID_FOR_TEST));
 
         sleep(Duration::from_millis(20)).await;
 
         // The rate limiter for this fid is evicted because the tti is 10ms and the rate limits are freed up again.
-        assert!(rate_limits.consume_for_fid(engine.shard_id(), FID_FOR_TEST));
+        assert!(rate_limits.consume_for_fid(FID_FOR_TEST));
     }
 
     #[tokio::test]
@@ -114,7 +121,9 @@ mod tests {
             user_data: 1000,
             user_name_proofs: 1000,
             verifications: 1000,
-        });
+            storage_lends: 1000,
+        })
+        .await;
 
         for fid in FID_FOR_TEST..FID_FOR_TEST + 11 {
             register_user(
@@ -133,18 +142,19 @@ mod tests {
                 max_capacity: 10,
             },
             statsd_client(),
+            1,
         );
 
         for fid in FID_FOR_TEST..FID_FOR_TEST + 11 {
-            for _ in 0..600 {
-                assert!(rate_limits.consume_for_fid(engine.shard_id(), fid))
+            for _ in 0..700 {
+                assert!(rate_limits.consume_for_fid(fid))
             }
         }
 
         // FID_FOR_TEST was LRU so it should be removed
-        assert!(rate_limits.consume_for_fid(engine.shard_id(), FID_FOR_TEST));
+        assert!(rate_limits.consume_for_fid(FID_FOR_TEST));
         for fid in FID_FOR_TEST + 1..FID_FOR_TEST + 11 {
-            assert!(!rate_limits.consume_for_fid(engine.shard_id(), fid));
+            assert!(!rate_limits.consume_for_fid(fid));
         }
     }
 
@@ -157,7 +167,9 @@ mod tests {
             user_data: 1,
             user_name_proofs: 1,
             verifications: 1,
-        });
+            storage_lends: 1,
+        })
+        .await;
 
         register_user(
             FID_FOR_TEST,
@@ -174,17 +186,18 @@ mod tests {
                 max_capacity: 10,
             },
             statsd_client(),
+            1,
         );
 
         // Min allowance is 100
         for _ in 0..100 {
-            assert!(rate_limits.consume_for_fid(engine.shard_id(), FID_FOR_TEST))
+            assert!(rate_limits.consume_for_fid(FID_FOR_TEST))
         }
     }
 
     #[tokio::test]
     async fn test_zero_storage_allowance() {
-        let (mut engine, shard_stores) = setup(limits::zero());
+        let (mut engine, shard_stores) = setup(limits::zero()).await;
 
         register_user(
             FID_FOR_TEST,
@@ -201,9 +214,10 @@ mod tests {
                 max_capacity: 10,
             },
             statsd_client(),
+            1,
         );
 
         // If allowance is 0, don't allow any messages. This more realistically happens when the user has no storage.
-        assert!(!rate_limits.consume_for_fid(engine.shard_id(), FID_FOR_TEST))
+        assert!(!rate_limits.consume_for_fid(FID_FOR_TEST))
     }
 }

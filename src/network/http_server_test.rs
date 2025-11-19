@@ -1,7 +1,8 @@
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use async_trait::async_trait;
-    use std::sync::Arc;
+    use std::{collections::HashMap, sync::Arc};
+    use tokio::sync::Mutex;
     use tokio_stream::wrappers::ReceiverStream;
     use tonic::{Request, Response, Status};
 
@@ -11,14 +12,17 @@ mod tests {
         proto::{hub_service_server::HubService, *},
     };
 
+    #[derive(Clone)]
     pub struct MockHubService {
         current_peers: Option<GetConnectedPeersResponse>,
+        pub call_counts: Arc<Mutex<HashMap<String, usize>>>,
     }
 
     impl MockHubService {
         pub fn new() -> Self {
             Self {
                 current_peers: None,
+                call_counts: Arc::new(Mutex::new(HashMap::new())),
             }
         }
     }
@@ -55,6 +59,12 @@ mod tests {
             _request: Request<BlocksRequest>,
         ) -> Result<Response<Self::GetBlocksStream>, Status> {
             let (_tx, rx) = tokio::sync::mpsc::channel(1);
+            self.call_counts
+                .lock()
+                .await
+                .entry("get_blocks".to_string())
+                .and_modify(|count| *count += 1)
+                .or_insert(1);
             Ok(Response::new(ReceiverStream::new(rx)))
         }
 
@@ -355,6 +365,14 @@ mod tests {
             Ok(Response::new(response))
         }
 
+        async fn get_all_lend_storage_messages_by_fid(
+            &self,
+            _request: Request<FidTimestampRequest>,
+        ) -> Result<Response<MessagesResponse>, Status> {
+            let response = MessagesResponse::default();
+            Ok(Response::new(response))
+        }
+
         async fn get_trie_metadata_by_prefix(
             &self,
             _request: Request<TrieNodeMetadataRequest>,
@@ -370,6 +388,7 @@ mod tests {
         mock_hub_service.current_peers = Some(GetConnectedPeersResponse {
             contacts: vec![ContactInfoBody {
                 gossip_address: "127.0.0.1:3382".to_string(),
+                announce_rpc_address: "http://127.0.0.1:3381".to_string(),
                 network: FarcasterNetwork::Mainnet as i32,
                 peer_id: vec![
                     0, 36, 8, 1, 18, 32, 113, 33, 69, 101, 159, 234, 6, 137, 235, 52, 28, 108, 100,
@@ -393,6 +412,7 @@ mod tests {
           "contacts": [
             {
               "gossip_address": "127.0.0.1:3382",
+              "announce_rpc_address": "http://127.0.0.1:3381",
               "peer_id": "12D3KooWHRyfTBKcjkqjNk5UZarJhzT7rXZYfr4DmaCWJgen62Xk",
               "snapchain_version": "0.2.1",
               "network": "Mainnet",

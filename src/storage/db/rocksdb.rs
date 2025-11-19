@@ -65,6 +65,13 @@ pub struct IteratorOptions {
     pub reverse: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SnapchainDbOptimizationType {
+    #[default]
+    Default, // Default read-write DB
+    BulkWriteOptimized, // Optimized for very large bulk writes
+}
+
 pub enum DBProvider {
     Transaction(TransactionDB),
     ReadOnly(DB),
@@ -75,6 +82,7 @@ pub struct RocksDB {
     inner: RwLock<Option<DBProvider>>,
 
     pub path: String,
+    pub db_options_type: SnapchainDbOptimizationType,
 }
 
 #[derive(Debug, Default)]
@@ -97,7 +105,27 @@ impl RocksDB {
         RocksDB {
             inner: RwLock::new(None),
             path: path.to_string(),
+            db_options_type: SnapchainDbOptimizationType::Default,
         }
+    }
+
+    pub fn new_with_options(path: &str, db_options_type: SnapchainDbOptimizationType) -> RocksDB {
+        info!({ path }, "Opening RocksDB database");
+
+        RocksDB {
+            inner: RwLock::new(None),
+            path: path.to_string(),
+            db_options_type,
+        }
+    }
+
+    pub fn open_bulk_write_shard_db(db_dir: &str, shard_id: u32) -> Arc<RocksDB> {
+        let db = RocksDB::new_with_options(
+            format!("{}/shard-{}", db_dir, shard_id).as_str(),
+            SnapchainDbOptimizationType::BulkWriteOptimized,
+        );
+        db.open().unwrap();
+        Arc::new(db)
     }
 
     pub fn open_shard_db(db_dir: &str, shard_id: u32) -> Arc<RocksDB> {
@@ -117,6 +145,25 @@ impl RocksDB {
 
         // Create RocksDB options
         let mut opts = Options::default();
+
+        if self.db_options_type == SnapchainDbOptimizationType::BulkWriteOptimized {
+            // 1. Increase the write buffer size. This is the size of a single in-memory memtable.
+            // For large, sustained writes, a larger buffer (e.g., 128MB) reduces how often
+            // the database flushes to disk
+            opts.set_write_buffer_size(512 * 1024 * 1024);
+
+            // 2. Increase the number of background threads for flushes and compactions.
+            opts.increase_parallelism(8);
+
+            // 3. Set the maximum number of write buffers. This allows RocksDB to continue
+            // accepting writes into a new memtable while old ones are being flushed.
+            opts.set_max_write_buffer_number(4);
+
+            // 4. Set the minimum number of write buffers to merge before flushing. 2
+            // allows us to "double-buffer" writes, allowing for more efficient flush-to-disk.
+            opts.set_min_write_buffer_number_to_merge(2);
+        }
+
         opts.create_if_missing(true); // Creates a database if it does not exist
         opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
 
@@ -152,6 +199,7 @@ impl RocksDB {
                 let rdb = RocksDB {
                     inner: RwLock::new(Some(provider)),
                     path: self.path.clone(),
+                    db_options_type: SnapchainDbOptimizationType::default(),
                 };
                 Ok(rdb)
             }
@@ -313,7 +361,10 @@ impl RocksDB {
             start_iterator_prefix
         } else {
             if let Some(page_token) = &page_options.page_token {
-                increment_vec_u8(&page_token)
+                // In RocksDB, the lexicographically next key after [1,2,3] is [1,2,3,0] (and NOT [1,2,4])
+                // This is because RocksDB uses a prefix-based storage engine, and the next key is determined by the last byte
+                // with smaller keys sorting BEFORE longer keys with the same prefix
+                [page_token.clone(), vec![0u8]].concat()
             } else {
                 start_iterator_prefix
             }
@@ -624,7 +675,7 @@ impl RocksDB {
 #[cfg(test)]
 mod tests {
     use crate::storage::{
-        db::{RocksDB, RocksDbTransactionBatch},
+        db::{PageOptions, RocksDB, RocksDbTransactionBatch},
         util::increment_vec_u8,
     };
 
@@ -875,5 +926,96 @@ mod tests {
         // Cleanup
         db.destroy().unwrap();
         db.open().unwrap();
+    }
+
+    // Helper function to test pagination through keys
+    fn test_pagination_helper(
+        db: &RocksDB,
+        expected_total_keys: usize,
+        page_size: usize,
+        start_prefix: Option<Vec<u8>>,
+        stop_prefix: Option<Vec<u8>>,
+    ) {
+        let mut last_key = None;
+        let mut processed_keys = 0;
+
+        loop {
+            let page_options = PageOptions {
+                page_size: Some(page_size),
+                page_token: last_key.clone(),
+                reverse: false,
+            };
+
+            let mut processed_this_pass = 0;
+            let all_done = db
+                .for_each_iterator_by_prefix_paged(
+                    start_prefix.clone(),
+                    stop_prefix.clone(),
+                    &page_options,
+                    |key, _value| {
+                        processed_this_pass += 1;
+
+                        if processed_this_pass == page_size {
+                            last_key = Some(key.to_vec());
+                            return Ok(true); // stop
+                        }
+
+                        return Ok(false); // continue
+                    },
+                )
+                .unwrap();
+            processed_keys += processed_this_pass;
+
+            if all_done {
+                assert_eq!(processed_this_pass, expected_total_keys % page_size);
+                break;
+            } else {
+                assert_eq!(processed_this_pass, page_size);
+            }
+        }
+
+        assert_eq!(processed_keys, expected_total_keys);
+    }
+
+    #[test]
+    fn test_iteration_pages_through_nested_keys() {
+        let tmp_path = tempfile::tempdir()
+            .unwrap()
+            .path()
+            .as_os_str()
+            .to_string_lossy()
+            .to_string();
+        let db = crate::storage::db::RocksDB::new(&tmp_path);
+        db.open().unwrap();
+
+        // Add 10 nested keys: [0], [0,1], [0,1,2], ..., [0,1,2,3,4,5,6,7,8,9]
+        for i in 0..10 {
+            let key: Vec<u8> = (0..=i).collect();
+            let value = format!("value{}", i).into_bytes();
+            db.put(&key, &value).unwrap();
+        }
+
+        test_pagination_helper(&db, 10, 3, Some(vec![0u8]), Some(vec![1u8]));
+    }
+
+    #[test]
+    fn test_iteration_pages_through_serial_keys() {
+        let tmp_path = tempfile::tempdir()
+            .unwrap()
+            .path()
+            .as_os_str()
+            .to_string_lossy()
+            .to_string();
+        let db = crate::storage::db::RocksDB::new(&tmp_path);
+        db.open().unwrap();
+
+        // Add 10 serial keys: [0,0,1], [0,0,2], [0,0,3], ..., [0,0,10]
+        for i in 1..=10 {
+            let key = vec![0u8, 0u8, i as u8];
+            let value = format!("value{}", i).into_bytes();
+            db.put(&key, &value).unwrap();
+        }
+
+        test_pagination_helper(&db, 10, 3, Some(vec![0u8]), Some(vec![1u8]));
     }
 }

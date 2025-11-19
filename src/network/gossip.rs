@@ -1,3 +1,4 @@
+use crate::cfg::{DEFAULT_GOSSIP_PORT, DEFAULT_RPC_PORT};
 use crate::consensus::consensus::{MalachiteEventShard, SystemMessage};
 use crate::consensus::malachite::network_connector::MalachiteNetworkEvent;
 use crate::consensus::malachite::snapchain_codec::SnapchainCodec;
@@ -8,7 +9,7 @@ use crate::proto::{
     GossipMessage,
 };
 use crate::storage::store::account::message_bytes_decode;
-use crate::storage::store::engine::MempoolMessage;
+use crate::storage::store::mempool_poller::MempoolMessage;
 use crate::utils::statsd_wrapper::StatsdClientWrapper;
 use crate::version::version::EngineVersion;
 use bytes::Bytes;
@@ -37,7 +38,6 @@ use tokio::sync::mpsc::Sender;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, error, info, warn};
 
-const DEFAULT_GOSSIP_PORT: u16 = 3382;
 const DEFAULT_GOSSIP_HOST: &str = "127.0.0.1";
 const MAX_GOSSIP_MESSAGE_SIZE: usize = 1024 * 1024 * 10; // 10 mb
 
@@ -49,12 +49,26 @@ const CONTACT_INFO: &str = "contact-info";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
+    // The address to listen on. (eg address="/ip4/0.0.0.0/udp/3382/quic-v1")
     pub address: String,
+    // What address to announce to peers. Useful if behind NAT or public IP is different.
+    // eg announce_address="/ip4/56.23.122.23/udp/3382/quic-v1"
+    // If empty, will try to detect public IP and fall back to `address` if detection fails.
     pub announce_address: String,
+    // What RPC address to announce to peers. Useful if behind NAT or public IP is different.
+    // eg announce_rpc_address="http://56.23.122.23:3381"
+    // or announce_rpc_address="https://mydomain.com:3381" if using a domain with SSL termination
+    pub announce_rpc_address: String,
+    // List of bootstrap peers to connect to on startup, comma-separated.
+    // eg bootstrap_peers = "/ip4/54.236.164.51/udp/3382/quic-v1, /ip4/54.87.204.167/udp/3382/quic-v1, ..."
     pub bootstrap_peers: String,
+    // Interval at which to publish our contact info to the network.
     pub contact_info_interval: Duration,
+    // Interval at which to attempt to reconnect to bootstrap peers if disconnected.
     pub bootstrap_reconnect_interval: Duration,
+    // Whether to enable auto-discovery of peers via contact info messages.
     pub enable_autodiscovery: bool,
+    // Comma-separated list of peer IDs to always connect to directly.
     pub direct_peers: String,
 }
 
@@ -67,6 +81,7 @@ impl Default for Config {
         Config {
             address: address.clone(),
             announce_address: "".to_string(),
+            announce_rpc_address: "".to_string(),
             bootstrap_peers: "".to_string(),
             contact_info_interval: Duration::from_secs(300),
             bootstrap_reconnect_interval: Duration::from_secs(30),
@@ -111,6 +126,13 @@ impl Config {
     pub fn with_announce_address(self, announce_address: String) -> Self {
         Config {
             announce_address,
+            ..self
+        }
+    }
+
+    pub fn with_announce_rpc_address(self, announce_rpc_address: String) -> Self {
+        Config {
+            announce_rpc_address,
             ..self
         }
     }
@@ -167,13 +189,14 @@ pub struct SnapchainGossip {
     pub swarm: Swarm<SnapchainBehavior>,
     pub tx: mpsc::Sender<GossipEvent<SnapchainValidatorContext>>,
     rx: mpsc::Receiver<GossipEvent<SnapchainValidatorContext>>,
-    system_tx: Sender<SystemMessage>,
+    system_tx: Option<Sender<SystemMessage>>,
     sync_channels: HashMap<InboundRequestId, sync::ResponseChannel>,
     read_node: bool,
     enable_autodiscovery: bool,
     bootstrap_addrs: HashSet<String>,
     connected_bootstrap_addrs: HashSet<String>,
-    announce_address: String,
+    announce_gossip_address: String,
+    announce_rpc_address: String,
     fc_network: FarcasterNetwork,
     contact_info_interval: Duration,
     bootstrap_reconnect_interval: Duration,
@@ -185,7 +208,7 @@ impl SnapchainGossip {
     pub async fn create(
         keypair: Keypair,
         config: &Config,
-        system_tx: Sender<SystemMessage>,
+        system_tx: Option<Sender<SystemMessage>>,
         read_node: bool,
         fc_network: FarcasterNetwork,
         statsd_client: StatsdClientWrapper,
@@ -307,9 +330,19 @@ impl SnapchainGossip {
         // Listen on all assigned port for this id
         swarm.listen_on(config.address.parse()?)?;
 
-        let announce_address = Self::get_announce_address(config).await;
+        let announce_gossip_address = Self::get_announce_gossip_address(fc_network, config).await;
+        let announce_rpc_address = match Self::get_announce_rpc_address(fc_network, config).await {
+            Ok(addr) => addr,
+            Err(e) => {
+                warn!("Failed to get announce RPC address: {}", e);
+                "".to_string()
+            }
+        };
 
-        info!("Using {} as announce address", announce_address);
+        info!(
+            announce_gossip_address,
+            announce_rpc_address, "Configured announce addresses",
+        );
 
         // ~5 seconds of buffer (assuming 1K msgs/pec)
         let (tx, rx) = mpsc::channel(5000);
@@ -321,7 +354,8 @@ impl SnapchainGossip {
             sync_channels: HashMap::new(),
             read_node,
             bootstrap_addrs: config.bootstrap_addrs().into_iter().collect(),
-            announce_address,
+            announce_gossip_address,
+            announce_rpc_address,
             fc_network,
             contact_info_interval: config.contact_info_interval,
             bootstrap_reconnect_interval: config.bootstrap_reconnect_interval,
@@ -332,9 +366,35 @@ impl SnapchainGossip {
         })
     }
 
-    async fn get_announce_address(config: &Config) -> String {
+    async fn get_announce_rpc_address(
+        fc_network: FarcasterNetwork,
+        config: &Config,
+    ) -> Result<String, reqwest::Error> {
+        if config.announce_rpc_address.len() > 0 {
+            return Ok(config.announce_rpc_address.clone());
+        }
+
+        if fc_network == FarcasterNetwork::Devnet {
+            // Don't try to fetch public IP for devnet/during tests
+            return Ok("".to_string());
+        }
+
+        // If no config-defined announce RPC IP exists, detect the public IP.
+        Self::get_public_ip()
+            .await
+            // Use http if using IP address (assumeno SSL)
+            .map(|ip| format!("http://{}:{}", ip, DEFAULT_RPC_PORT))
+    }
+
+    async fn get_announce_gossip_address(fc_network: FarcasterNetwork, config: &Config) -> String {
         if config.announce_address.len() > 0 {
             return config.announce_address.clone();
+        }
+
+        if fc_network == FarcasterNetwork::Devnet {
+            // Don't try to fetch public IP for devnet/during tests
+            // Fallback to address.
+            return config.address.clone();
         }
 
         // If no config-defined announce IP exists, detect the public IP.
@@ -398,7 +458,8 @@ impl SnapchainGossip {
         let contact_info = ContactInfo {
             body: Some(ContactInfoBody {
                 peer_id: self.swarm.local_peer_id().to_bytes(),
-                gossip_address: self.announce_address.clone(),
+                gossip_address: self.announce_gossip_address.clone(),
+                announce_rpc_address: self.announce_rpc_address.clone(),
                 network: self.fc_network as i32,
                 snapchain_version: current_version.to_string(),
                 timestamp: std::time::SystemTime::now()
@@ -425,7 +486,7 @@ impl SnapchainGossip {
             tokio::select! {
                 _ = reconnect_timer.tick() => {
                     self.check_and_reconnect_to_bootstrap_peers().await;
-                    self.statsd_client.gauge("gossip.connected_peers", self.swarm.connected_peers().count() as u64);
+                    self.statsd_client.gauge("gossip.connected_peers", self.swarm.connected_peers().count() as u64, vec![]);
                 },
                 _ = publish_contact_info_timer.tick() => {
                     if self.read_node {
@@ -437,11 +498,12 @@ impl SnapchainGossip {
                     match gossip_event {
                         SwarmEvent::ConnectionEstablished {peer_id, endpoint, ..} => {
                             info!(total_peers = self.swarm.connected_peers().count(), "Connection established with peer: {peer_id}");
-                            let event = MalachiteNetworkEvent::PeerConnected(MalachitePeerId::from_libp2p(&peer_id));
-                            let res = self.system_tx.send(SystemMessage::MalachiteNetwork(MalachiteEventShard::None, event)).await;
-                            if let Err(e) = res {
-                                warn!("Failed to send connection established message: {}", e);
-                            };
+                            if let Some(system_tx) = &self.system_tx {
+                                let event = MalachiteNetworkEvent::PeerConnected(MalachitePeerId::from_libp2p(&peer_id));
+                                if let Err(e) = system_tx.send(SystemMessage::MalachiteNetwork(MalachiteEventShard::None, event)).await {
+                                    warn!("Failed to send connection established message: {}", e);
+                                }
+                            }
                             match endpoint {
                                 libp2p::core::ConnectedPoint::Dialer { address, ..} => {
                                     if self.bootstrap_addrs.contains(&address.to_string()) {
@@ -454,10 +516,11 @@ impl SnapchainGossip {
                         },
                         SwarmEvent::ConnectionClosed {peer_id, cause, endpoint, ..} => {
                             info!("Connection closed with peer: {:?} due to: {:?}", peer_id, cause);
-                            let event = MalachiteNetworkEvent::PeerDisconnected(MalachitePeerId::from_libp2p(&peer_id));
-                            let res = self.system_tx.send(SystemMessage::MalachiteNetwork(MalachiteEventShard::None, event)).await;
-                            if let Err(e) = res {
-                                warn!("Failed to send connection closed message: {}", e);
+                            if let Some(system_tx) = &self.system_tx {
+                                let event = MalachiteNetworkEvent::PeerDisconnected(MalachitePeerId::from_libp2p(&peer_id));
+                                if let Err(e) = system_tx.send(SystemMessage::MalachiteNetwork(MalachiteEventShard::None, event)).await {
+                                    warn!("Failed to send connection closed message: {}", e);
+                                }
                             }
                             match endpoint {
                                 libp2p::core::ConnectedPoint::Dialer { address, ..} => {
@@ -472,9 +535,10 @@ impl SnapchainGossip {
                             info!("Peer: {peer_id} unsubscribed to topic: {topic}"),
                         SwarmEvent::NewListenAddr { address, .. } => {
                             info!(address = address.to_string(), "Local node is listening");
-                            let res = self.system_tx.send(SystemMessage::MalachiteNetwork(MalachiteEventShard::None, MalachiteNetworkEvent::Listening(address))).await;
-                            if let Err(e) = res {
-                                warn!("Failed to send Listening message: {}", e);
+                            if let Some(system_tx) = &self.system_tx {
+                                if let Err(e) = system_tx.send(SystemMessage::MalachiteNetwork(MalachiteEventShard::None, MalachiteNetworkEvent::Listening(address))).await {
+                                    warn!("Failed to send Listening message: {}", e);
+                                }
                             }
                         },
                         SwarmEvent::OutgoingConnectionError {connection_id: _, peer_id, error} => {
@@ -485,10 +549,14 @@ impl SnapchainGossip {
                             message_id: _id,
                             message,
                         })) => {
-                            if let Some(system_message) = self.map_gossip_bytes_to_system_message(peer_id, message.data) {
-                                let res = self.system_tx.send(system_message).await;
-                                if let Err(e) = res {
-                                    warn!("Failed to send system block message: {}", e);
+                            // Take an owned sender if present to avoid holding an immutable borrow during mutable self call
+                            let maybe_sender = self.system_tx.as_ref().cloned();
+                            if let Some(system_tx) = maybe_sender {
+                                let data = message.data.clone();
+                                if let Some(system_message) = self.map_gossip_bytes_to_system_message(peer_id, data) {
+                                    if let Err(e) = system_tx.send(system_message).await {
+                                        warn!("Failed to send system block message: {}", e);
+                                    }
                                 }
                             }
                         },
@@ -507,11 +575,12 @@ impl SnapchainGossip {
                                                 peer: MalachitePeerId::from_libp2p(&peer),
                                                 body: request.0,
                                             };
-                                            let event = Self::map_sync_message_to_system_message(request);
-                                            if let Some(event) = event {
-                                                let res = self.system_tx.send(event).await;
-                                                if let Err(e) = res {
-                                                    warn!("Failed to send RPC request message: {}", e);
+                                            if let Some(system_tx) = &self.system_tx {
+                                                let event = Self::map_sync_message_to_system_message(request);
+                                                if let Some(event) = event {
+                                                    if let Err(e) = system_tx.send(event).await {
+                                                        warn!("Failed to send RPC request message: {}", e);
+                                                    }
                                                 }
                                             }
                                         },
@@ -524,11 +593,12 @@ impl SnapchainGossip {
                                                 peer: MalachitePeerId::from_libp2p(&peer),
                                                 body: response.0,
                                             };
-                                            let event = Self::map_sync_message_to_system_message(event);
-                                            if let Some(event) = event {
-                                                let res = self.system_tx.send(event).await;
-                                                if let Err(e) = res {
-                                                    warn!("Failed to send RPC request message: {}", e);
+                                            if let Some(system_tx) = &self.system_tx {
+                                                let event = Self::map_sync_message_to_system_message(event);
+                                                if let Some(event) = event {
+                                                    if let Err(e) = system_tx.send(event).await {
+                                                        warn!("Failed to send RPC request message: {}", e);
+                                                    }
                                                 }
                                             }
                                         },

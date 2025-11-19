@@ -1,13 +1,6 @@
-use std::{
-    collections::HashMap,
-    sync::{Arc, RwLock},
-};
-
-use tracing::{error, warn};
-
 use crate::{
+    network::replication::{error::ReplicationError, replicator::ShardMetadata},
     proto,
-    replication::error::ReplicationError,
     storage::{
         db::RocksDB,
         store::stores::{StoreLimits, Stores},
@@ -15,6 +8,11 @@ use crate::{
     },
     utils::statsd_wrapper::StatsdClientWrapper,
 };
+use std::{
+    collections::HashMap,
+    sync::{Arc, RwLock},
+};
+use tracing::{debug, error};
 
 type TimestampedStore = (u64, Stores); // (farcaster timestamp, Stores)
 
@@ -22,7 +20,6 @@ pub struct ReplicationStores {
     shard_stores: HashMap<u32, Stores>,
     // Shard -> Height -> TimestampedStore
     read_only_stores: RwLock<HashMap<u32, HashMap<u64, TimestampedStore>>>,
-    trie_branching_factor: u32,
     statsd_client: StatsdClientWrapper,
     network: proto::FarcasterNetwork,
 }
@@ -32,17 +29,19 @@ impl ReplicationStores {
 
     pub fn new(
         shard_stores: HashMap<u32, Stores>,
-        trie_branching_factor: u32,
         statsd_client: StatsdClientWrapper,
         network: proto::FarcasterNetwork,
     ) -> Self {
         ReplicationStores {
             shard_stores,
-            trie_branching_factor,
             statsd_client: statsd_client,
             read_only_stores: RwLock::new(HashMap::new()),
             network,
         }
+    }
+
+    pub fn network(&self) -> proto::FarcasterNetwork {
+        self.network.clone()
     }
 
     pub fn get(&self, shard: u32, height: u64) -> Option<Stores> {
@@ -59,12 +58,17 @@ impl ReplicationStores {
     }
 
     // Returns a list of (height, farcaster timestamp) pairs for the given shard.
-    pub fn get_metadata(&self, shard: u32) -> Result<Vec<(u64, u64)>, ReplicationError> {
+    pub fn get_metadata(&self, shard: u32) -> Result<Vec<ShardMetadata>, ReplicationError> {
         let results = match self.read_only_stores.read() {
             Ok(stores) => stores.get(&shard).map(|snapshots| {
                 snapshots
                     .iter()
-                    .map(|(&height, (timestamp, _))| (height, *timestamp))
+                    .map(|(&height, (timestamp, stores))| ShardMetadata {
+                        shard_id: shard,
+                        height,
+                        timestamp: *timestamp,
+                        num_items: stores.trie.items().unwrap_or(0),
+                    })
                     .collect()
             }),
             Err(_) => {
@@ -98,7 +102,7 @@ impl ReplicationStores {
         timestamp: u64,
         read_only_db: RocksDB,
     ) -> TimestampedStore {
-        let trie = merkle_trie::MerkleTrie::new(self.trie_branching_factor).unwrap();
+        let trie = merkle_trie::MerkleTrie::new().unwrap();
         let store = Stores::new(
             Arc::new(read_only_db),
             shard,
@@ -176,7 +180,7 @@ impl ReplicationStores {
             Some(shard_stores) => {
                 shard_stores.retain(|&_, &mut (timestamp, _)| timestamp >= min_timestamp)
             }
-            None => warn!("Shard {} not found in read_only_stores", shard),
+            None => debug!("Shard {} has no snapshots in read_only_stores", shard),
         }
 
         self.capture_snapshot_metrics(&stores);

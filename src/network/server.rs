@@ -35,9 +35,10 @@ use crate::storage::store::account::{
     CastStore, LinkStore, ReactionStore, UserDataStore, VerificationStore,
 };
 use crate::storage::store::account::{EventsPage, HubEventIdGenerator};
-use crate::storage::store::engine::{MempoolMessage, MessageValidationError, Senders, ShardEngine};
+use crate::storage::store::block_engine::{self, BlockStores};
+use crate::storage::store::engine::{self, Senders, ShardEngine};
+use crate::storage::store::mempool_poller::MempoolMessage;
 use crate::storage::store::stores::Stores;
-use crate::storage::store::BlockStore;
 use crate::utils::statsd_wrapper::StatsdClientWrapper;
 use crate::version::version::{EngineVersion, ProtocolFeature};
 use hex::ToHex;
@@ -58,7 +59,7 @@ const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_millis(100);
 
 pub struct MyHubService {
     allowed_users: HashMap<String, String>,
-    block_store: BlockStore,
+    block_stores: BlockStores,
     shard_stores: HashMap<u32, Stores>,
     shard_senders: HashMap<u32, Senders>,
     num_shards: u32,
@@ -76,7 +77,7 @@ pub struct MyHubService {
 impl MyHubService {
     pub fn new(
         rpc_auth: String,
-        block_store: BlockStore,
+        block_stores: BlockStores,
         shard_stores: HashMap<u32, Stores>,
         shard_senders: HashMap<u32, Senders>,
         statsd_client: StatsdClientWrapper,
@@ -111,7 +112,7 @@ impl MyHubService {
         let service = Self {
             allowed_users,
             network,
-            block_store,
+            block_stores,
             shard_senders,
             shard_stores,
             statsd_client,
@@ -136,39 +137,9 @@ impl MyHubService {
             return Err(HubError::invalid_parameter("fid cannot be 0"));
         }
 
-        let dst_shard = self.message_router.route_fid(fid, self.num_shards);
+        let dst_shard = routing::route_message(&self.message_router, &message, self.num_shards);
 
-        let stores = match self.shard_stores.get(&dst_shard) {
-            Some(store) => store,
-            None => return Err(HubError::invalid_parameter("shard not found for fid")),
-        };
-
-        let result = {
-            // TODO: This is a hack to get around the fact that self cannot be made mutable
-            let mut readonly_engine = ShardEngine::new(
-                stores.db.clone(),
-                self.network,
-                stores.trie.clone(),
-                1,
-                stores.store_limits.clone(),
-                self.statsd_client.clone(),
-                100,
-                None,
-                None,
-                None,
-            );
-            readonly_engine.simulate_message(&message)
-        };
-
-        if let Err(err) = result {
-            return match err {
-                MessageValidationError::StoreError(hub_error) => {
-                    // Forward hub errors as is, otherwise we end up wrapping them
-                    Err(hub_error)
-                }
-                _ => Err(HubError::validation_failure(&err.to_string())),
-            };
-        }
+        self.simulate_message_for_shard(&message, dst_shard).await?;
 
         // Process the submitted message
         self.submit_message_to_mempool(message).await
@@ -253,6 +224,7 @@ impl MyHubService {
         let result = match timeout(MEMPOOL_ADD_REQUEST_TIMEOUT, rx).await {
             Ok(Ok(result)) => result,
             Ok(Err(err)) => {
+                self.statsd_client.count("rpc.mempool_submit_error", 1);
                 error!(
                     "Error receiving message from mempool channel: {:?}",
                     err.to_string()
@@ -260,6 +232,7 @@ impl MyHubService {
                 return Err(HubError::unavailable("Error adding to mempool"));
             }
             Err(_) => {
+                self.statsd_client.count("rpc.mempool_submit_timeout", 1);
                 error!("Timeout receiving message from mempool channel",);
                 return Err(HubError::unavailable("Error adding to mempool"));
             }
@@ -283,6 +256,120 @@ impl MyHubService {
     fn get_stores_for(&self, fid: u64) -> Result<&Stores, Status> {
         let shard_id = self.message_router.route_fid(fid, self.num_shards);
         self.get_stores_for_shard(shard_id)
+    }
+
+    async fn simulate_message_for_shard(
+        &self,
+        message: &proto::Message,
+        shard_id: u32,
+    ) -> Result<(), HubError> {
+        if shard_id == 0 {
+            // Handle shard 0 (block engine) specially
+            let mut block_engine = block_engine::BlockEngine::new(
+                self.block_stores.trie.clone(),
+                self.statsd_client.clone(),
+                self.block_stores.db.clone(),
+                100,
+                None,
+                self.network,
+            );
+
+            block_engine.simulate_message(message).map_err(|e| match e {
+                block_engine::MessageValidationError::HubError(hub_error) => hub_error,
+                _ => HubError::validation_failure(&e.to_string()),
+            })
+        } else {
+            let stores = match self.shard_stores.get(&shard_id) {
+                Some(store) => store,
+                None => return Err(HubError::invalid_parameter("shard not found for fid")),
+            };
+
+            // TODO: This is a hack to get around the fact that self cannot be made mutable
+            let mut readonly_engine = ShardEngine::new(
+                stores.db.clone(),
+                self.network,
+                stores.trie.clone(),
+                1,
+                stores.store_limits.clone(),
+                self.statsd_client.clone(),
+                100,
+                None,
+                None,
+                None,
+            )
+            .await?;
+
+            readonly_engine
+                .simulate_message(message)
+                .map_err(|err| match err {
+                    engine::MessageValidationError::StoreError(hub_error) => {
+                        // Forward hub errors as is, otherwise we end up wrapping them
+                        hub_error
+                    }
+                    _ => HubError::validation_failure(&err.to_string()),
+                })
+        }
+    }
+
+    async fn simulate_bulk_messages_for_shard(
+        &self,
+        messages: &[proto::Message],
+        shard_id: u32,
+    ) -> Vec<Result<(), HubError>> {
+        if shard_id == 0 {
+            messages
+                .iter()
+                .map(|_| {
+                    Err(HubError::validation_failure(
+                        "submit bulk messages not supported for shard 0",
+                    ))
+                })
+                .collect()
+        } else {
+            let stores = match self.shard_stores.get(&shard_id) {
+                Some(store) => store,
+                None => {
+                    let error = HubError::invalid_parameter("shard not found for fid");
+                    return messages.iter().map(|_| Err(error.clone())).collect();
+                }
+            };
+
+            // Create shard engine for bulk simulation
+            let mut readonly_engine = match ShardEngine::new(
+                stores.db.clone(),
+                self.network,
+                stores.trie.clone(),
+                shard_id,
+                stores.store_limits.clone(),
+                self.statsd_client.clone(),
+                100,
+                None,
+                None,
+                None,
+            )
+            .await
+            {
+                Ok(engine) => engine,
+                Err(err) => {
+                    let hub_error = HubError::invalid_internal_state(&err.to_string());
+                    return messages.iter().map(|_| Err(hub_error.clone())).collect();
+                }
+            };
+
+            readonly_engine
+                .simulate_bulk_messages(messages)
+                .into_iter()
+                .map(|result| {
+                    result.map_err(|err| match err {
+                        engine::MessageValidationError::StoreError(hub_error) => {
+                            // Forward hub errors as is, otherwise we end up wrapping them
+                            hub_error
+                        }
+                        _ => HubError::validation_failure(&err.to_string()),
+                    })
+                })
+                .collect()
+        }
     }
 
     pub async fn validate_contract_signature(
@@ -616,7 +703,7 @@ impl HubService for MyHubService {
         // 1. Group messages by their destination shard
         let mut messages_by_shard: HashMap<u32, Vec<proto::Message>> = HashMap::new();
         for msg in messages {
-            let shard_id = self.message_router.route_fid(msg.fid(), self.num_shards);
+            let shard_id = routing::route_message(&self.message_router, &msg, self.num_shards);
             messages_by_shard.entry(shard_id).or_default().push(msg);
         }
 
@@ -624,39 +711,13 @@ impl HubService for MyHubService {
 
         // 2. Process each shard's batch transactionally for validation
         for (shard_id, batch) in messages_by_shard {
-            let stores = match self.shard_stores.get(&shard_id) {
-                Some(s) => s,
-                None => {
-                    // If shard doesn't exist, fail all messages for this shard
-                    for msg in batch {
-                        results.push(create_error_response(
-                            msg.hash,
-                            HubError::invalid_parameter("invalid shard for fid"),
-                        ));
-                    }
-                    continue;
-                }
-            };
-
-            // Create a temporary, mutable engine for simulation
-            // TODO: This is a hack to get around the fact that self cannot be made mutable
-            let mut engine = ShardEngine::new(
-                stores.db.clone(),
-                self.network,
-                stores.trie.clone(),
-                shard_id,
-                stores.store_limits.clone(),
-                self.statsd_client.clone(),
-                100,
-                None,
-                None,
-                None,
-            );
-
-            // 3. Simulate the entire batch for the shard
             self.statsd_client
                 .count("rpc.submit_message_in_flight", batch.len() as i64);
-            let sim_results = engine.simulate_bulk_messages(&batch);
+
+            // 3. Simulate the entire batch for the shard using our helper
+            let sim_results = self
+                .simulate_bulk_messages_for_shard(&batch, shard_id)
+                .await;
 
             // 4. Process simulation results
             for (sim_result, msg) in sim_results.into_iter().zip(batch.into_iter()) {
@@ -682,12 +743,9 @@ impl HubService for MyHubService {
                             }
                         });
                     }
-                    Err(validation_err) => {
+                    Err(hub_error) => {
                         // 4b. If simulation fails, create an error response for the message
-                        results.push(create_error_response(
-                            msg.hash,
-                            HubError::validation_failure(&validation_err.to_string()),
-                        ));
+                        results.push(create_error_response(msg.hash, hub_error));
                     }
                 }
             }
@@ -711,7 +769,7 @@ impl HubService for MyHubService {
 
         info!( {start_block_number, stop_block_number}, "Received call to [get_blocks] RPC");
 
-        let block_store = self.block_store.clone();
+        let block_store = self.block_stores.block_store.clone();
 
         tokio::spawn(async move {
             let mut next_page_token = None;
@@ -805,11 +863,39 @@ impl HubService for MyHubService {
         let current_time = get_farcaster_time().unwrap_or(0);
         let block_info = proto::ShardInfo {
             shard_id: 0,
-            max_height: self.block_store.max_block_number().unwrap_or(0),
-            num_messages: 0,
+            max_height: self
+                .block_stores
+                .block_store
+                .max_block_number()
+                .unwrap_or(0),
+            num_messages: self
+                .block_stores
+                .trie
+                .get_count(
+                    &self.block_stores.db,
+                    &mut RocksDbTransactionBatch::new(),
+                    &[],
+                )
+                .map_err(|err| Status::internal(err.to_string()))?,
+            num_onchain_events: 0,
+            // TODO(aditi): [num_onchain_events] is making the endpoint really slow, enable once there's a faster implementation
+            // num_onchain_events: self
+            //     .block_stores
+            //     .db
+            //     .count_keys_at_prefix(vec![
+            //         RootPrefix::OnChainEvent as u8,
+            //         OnChainEventPostfix::OnChainEvents as u8,
+            //     ])
+            //     .map_err(|err| Status::from_error(Box::new(err)))?
+            //     as u64,
             num_fid_registrations: 0,
-            approx_size: self.block_store.db.approximate_size(),
-            block_delay: current_time - self.block_store.max_block_timestamp().unwrap_or(0),
+            approx_size: self.block_stores.block_store.db.approximate_size(),
+            block_delay: current_time
+                - self
+                    .block_stores
+                    .block_store
+                    .max_block_timestamp()
+                    .unwrap_or(0),
             mempool_size: 0,
         };
         shard_infos.push(block_info);
@@ -831,11 +917,10 @@ impl HubService for MyHubService {
 
         for (shard_index, shard_store) in self.shard_stores.iter() {
             let shard_approx_size = shard_store.db.approximate_size();
-            let shard_num_messages = shard_store.trie.get_count(
-                &shard_store.db,
-                &mut RocksDbTransactionBatch::new(),
-                &[],
-            );
+            let shard_num_messages = shard_store
+                .trie
+                .get_count(&shard_store.db, &mut RocksDbTransactionBatch::new(), &[])
+                .map_err(|err| Status::internal(err.to_string()))?;
             let shard_fid_registrations = shard_store
                 .db
                 .count_keys_at_prefix(vec![
@@ -851,6 +936,7 @@ impl HubService for MyHubService {
                 shard_id: *shard_index,
                 max_height: shard_store.shard_store.max_block_number().unwrap_or(0),
                 num_messages: shard_num_messages,
+                num_onchain_events: 0, // TODO(aditi): Populating this is making the endpoint slow, enable once there's a faster implementation
                 num_fid_registrations: shard_fid_registrations,
                 approx_size: shard_approx_size,
                 block_delay: current_time.saturating_sub(max_block_time),
@@ -1376,6 +1462,19 @@ impl HubService for MyHubService {
         let (start_ts, stop_ts) = request.timestamps();
         stores
             .verification_store
+            .get_all_messages_by_fid(request.fid, start_ts, stop_ts, &request.page_options())
+            .as_response()
+    }
+
+    async fn get_all_lend_storage_messages_by_fid(
+        &self,
+        request: Request<FidTimestampRequest>,
+    ) -> Result<Response<MessagesResponse>, Status> {
+        let request = request.into_inner();
+        let (start_ts, stop_ts) = request.timestamps();
+        // These messages are stored on all shards. Query them from the block shard because this is the source of truth.
+        self.block_stores
+            .storage_lend_store
             .get_all_messages_by_fid(request.fid, start_ts, stop_ts, &request.page_options())
             .as_response()
     }

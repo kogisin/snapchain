@@ -114,6 +114,8 @@ pub enum ValidationError {
     EthAddressMissing,
     #[error("solana address is missing")]
     SolAddressMissing,
+    #[error("CAIP-19 string too long")]
+    Caip19TooLong,
     #[error("blockHash must be 32 bytes")]
     InvalidBlockhashLength,
     #[error("blockHash is missing")]
@@ -144,6 +146,12 @@ pub enum ValidationError {
     MissingEmbed,
     #[error("timestamp more than 10 mins in the future")]
     TimestampTooFarInFuture,
+    #[error("timestamp more than 10 mins in the past")]
+    TimestampTooFarInThePast,
     #[error(transparent)]
     HubError(#[from] HubError),
+    #[error("invalid storage unit type")]
+    InvalidStorageUnitType,
+    #[error("num storage units too large")]
+    ExceededMaxStorageUnits,
 }

@@ -2,6 +2,167 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.10.0] - 2025-10-22
+
+### 🚀 Features
+
+- Stop revoking all  messages signed by revoked signers (#714)
+
+### 🐛 Bug Fixes
+
+- Reset events sequence number on validate (#713)
+
+## [0.9.2] - 2025-10-14
+
+### 🐛 Bug Fixes
+
+- Add http server support for storage lend messages (#709)
+
+### ⚙️ Miscellaneous Tasks
+
+- Send onchain events to shard 0 (#705)
+- Downgrade failed onchain event merge log to warn (#710)
+
+## [0.9.1] - 2025-10-09
+
+### ⚙️ Miscellaneous Tasks
+
+- Add bulk rpc for querying `LendStorage` messages (#702)
+- Enable replication server by default (#703)
+- Stop populating num_onchain_events in the GetInfo endpoint (#706)
+
+## [0.9.0] - 2025-10-01
+
+### 🚀 Features
+
+- Implement pruning for storage lends (#683)
+- Enable submitting storage lends via rpc (#688)
+- Do a "fast" catchup on shard-0 by streaming blocks during replication (#693)
+- Enable migrating onchain events to shard 0 and fix bugs with storage lending (#669)
+
+### 🐛 Bug Fixes
+
+- Make shard-0 block to Sep 3 2025 (#692)
+- Update ETA constant for replication (#694)
+
+### ⚙️ Miscellaneous Tasks
+
+- Separate out ContactInfo and GossipMessage protos (#695)
+- Increase minimum storage requirement for storage lending (#698)
+- Set protocol release date to 10/8 (#699)
+
+## [0.8.1] - 2025-09-23
+
+### 🚀 Features
+
+- Enable sending onchain events to shard 0 (#676)
+- Configure or get (from public IP) announce_rpc_address (#681)
+- Discover nodes to sync with using gossip p2p (#682)
+- Ensure we have at least 65k FD limit to start replicator (#685)
+- Pick shard-0 blocks for replicator (#687)
+- Add progress for replication and other nice to haves (#689)
+
+### 🐛 Bug Fixes
+
+- Generate replicator snapshots every 8 hours (#680)
+- Handle duplicates while inserting in the trie (#679)
+- Dont create block_store in main() (#686)
+
+### 🧪 Testing
+
+- Add multi-page/rpc errors tests (#677)
+
+### ⚙️ Miscellaneous Tasks
+
+- Push protocol release out by 2 weeks (#690)
+
+## [0.8.0] - 2025-09-16
+
+### 🚀 Features
+
+- Add trie paged iteration + remove attach_to_root (#660)
+- Add trie-based replication server (#663)
+- Add profile token user data type (#666)
+- Add the ability to start a node via replication (#667)
+- Support storage lending in the shard and block engines (#665)
+- Add client manager + tests for replication rpc requests (#672)
+
+### 🐛 Bug Fixes
+
+- Hardcode the trie_branching_factor to 16 (#668)
+- Update block event seqnum correctly if there are multiple block events in a single transaction (#673)
+- Simplify the replication by removing trie/DB threads (#671)
+- Rename replication rs files (#675)
+
+### ⚙️ Miscellaneous Tasks
+
+- Add chain tag to some onchain event metrics (#664)
+
+## [0.7.0] - 2025-09-03
+
+### 🚀 Features
+
+- Produce transactions and events in shard 0 (#634)
+- Allow attaching orphaned nodes to the merkle trie (#651)
+- Read block events from shard 0 in other shards (#639)
+
+## [0.6.0] - 2025-08-27
+
+### 🐛 Bug Fixes
+
+- Paged iterator doesn't go through sub-keys (#652)
+
+### ⚙️ Miscellaneous Tasks
+
+- Push EngineVersion::V8 activation date up a week (#655)
+- Add metric for confirmed shard heights (#656)
+
+## [0.5.1] - 2025-08-25
+
+### 🚀 Features
+
+- Add ability to batch insert into trie (#637)
+- Create a new bulk-optimized DB option (#638)
+- Allow conflict-free stores for replicator (#648)
+
+### 🐛 Bug Fixes
+
+- Don't return duplicate FIDs (#641)
+- Fix consensus tests (#644)
+- Fix build (#647)
+- Correctly route fnames to all shards (#650)
+
+## [0.5.0] - 2025-08-18
+
+### 🚀 Features
+
+- Add support for onchain events and verification messages in a single transaction (#608)
+- Return account root hash for each fid in transaction (#621)
+- Decouple shard 0 block production from other shards block production (#619)
+
+### 🐛 Bug Fixes
+
+- Update tagging instructions in readme
+- Fix tests to increment and decrement hash values correctly (#613)
+- Switch to polling getLogs for Base pro events to fix not picking up events (#616)
+- Fix testnet version schedule to reflect when upgrade actually happened (#618)
+- Handle replicator cursor gets stuck (#617)
+- Add additional sync metrics to improve visibility (#631)
+- Fix fname secondary DB index (#622)
+- Don't run parallel migrations + quiet migration logs (#632)
+- Supress version check log message (#633)
+
+### 💼 Other
+
+- Log flaky test failure (#628)
+
+### ⚙️ Miscellaneous Tasks
+
+- Add link store tests (#612)
+- Enable new version on testnet (#636)
+- Extract mempool polling logic into a module for sharing (#629)
+- Pull engine metrics publishing out into a module for sharing (#630)
+
 ## [0.4.1] - 2025-08-01
 
 ### 🚀 Features

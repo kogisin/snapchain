@@ -55,6 +55,10 @@ pub trait SnapchainContext:
 {
 }
 
+pub trait Shardable {
+    fn shard_id(&self) -> u32;
+}
+
 // TODO: Should validator keys be ECDSA?
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Address(pub [u8; 32]);
@@ -821,6 +825,24 @@ impl informalsystems_malachitebft_core_types::Validator<SnapchainValidatorContex
 
     fn voting_power(&self) -> VotingPower {
         1
+    }
+}
+
+impl proto::BlockEvent {
+    pub fn seqnum(&self) -> u64 {
+        self.data.as_ref().unwrap().seqnum
+    }
+
+    pub fn block_number(&self) -> u64 {
+        self.data.as_ref().unwrap().block_number
+    }
+
+    pub fn block_timestamp(&self) -> u64 {
+        self.data.as_ref().unwrap().block_timestamp
+    }
+
+    pub fn event_index(&self) -> u64 {
+        self.data.as_ref().unwrap().event_index
     }
 }
 

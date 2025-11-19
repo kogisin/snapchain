@@ -4,7 +4,6 @@ use super::super::{
     util::{blake3_20, bytes_compare},
 };
 use super::errors::TrieError;
-use super::merkle_trie::TrieSnapshot;
 use crate::proto::DbTrieNode;
 use prost::Message as _;
 use std::collections::HashMap;
@@ -96,7 +95,7 @@ impl TrieNode {
     #[inline]
     pub(crate) fn make_primary_key(prefix: &[u8], child_char: Option<u8>) -> Vec<u8> {
         let mut key = Vec::with_capacity(1 + prefix.len() + 1);
-        key.push(RootPrefix::SyncMerkleTrieNode as u8);
+        key.push(RootPrefix::MerkleTrieNode as u8);
         key.extend_from_slice(prefix);
         if let Some(char) = child_char {
             key.push(char);
@@ -190,7 +189,6 @@ impl TrieNode {
         blake3_20(&concat_hashes)
     }
 
-    #[cfg(test)]
     pub fn value(&self) -> Option<Vec<u8>> {
         // Value is only defined for leaf nodes
         if self.is_leaf() {
@@ -198,6 +196,21 @@ impl TrieNode {
         } else {
             None
         }
+    }
+
+    #[cfg(test)]
+    pub fn set_children(&mut self, children: HashMap<u8, TrieNodeType>) {
+        self.children = children;
+    }
+
+    #[cfg(test)]
+    pub fn set_child_hashes(&mut self, child_hashes: HashMap<u8, Vec<u8>>) {
+        self.child_hashes = child_hashes;
+    }
+
+    #[cfg(test)]
+    pub fn child_hashes(&self) -> &HashMap<u8, Vec<u8>> {
+        &self.child_hashes
     }
 
     pub fn children(&self) -> &HashMap<u8, TrieNodeType> {
@@ -288,7 +301,6 @@ impl TrieNode {
                 .filter_map(|(i, key)| {
                     if bytes_compare(self.key.as_ref().unwrap_or(&vec![]), key.as_slice()) == 0 {
                         // Key already exists, do nothing
-                        results[i] = false;
                         None
                     } else {
                         Some((i + if inserted { 1 } else { 0 }, key)) // If we already pop()ed the first key, the index is i + 1
@@ -619,32 +631,6 @@ impl TrieNode {
         Ok(())
     }
 
-    fn excluded_hash(
-        &mut self,
-        ctx: &Context,
-        db: &RocksDB,
-        prefix: &[u8],
-        prefix_char: u8,
-    ) -> Result<(usize, String), TrieError> {
-        let mut excluded_items = 0;
-        let mut child_hashes = vec![];
-
-        let mut sorted_children = self.children.keys().map(|c| *c).collect::<Vec<_>>();
-        sorted_children.sort();
-
-        for char in sorted_children {
-            if char != prefix_char {
-                let child_node = self.get_or_load_child(ctx, db, prefix, char)?;
-                child_hashes.push(child_node.hash().clone());
-                excluded_items += child_node.items;
-            }
-        }
-
-        let hash = blake3_20(&child_hashes.concat());
-
-        Ok((excluded_items, hex::encode(hash.as_slice())))
-    }
-
     fn put_to_txn(&self, txn: &mut RocksDbTransactionBatch, prefix: &[u8]) {
         let key = Self::make_primary_key(prefix, None);
         let serialized = Self::serialize(self);
@@ -683,46 +669,6 @@ impl TrieNode {
         }
 
         Ok(values)
-    }
-
-    pub fn get_snapshot(
-        &mut self,
-        ctx: &Context,
-        db: &RocksDB,
-        prefix: &[u8],
-        current_index: usize,
-    ) -> Result<TrieSnapshot, TrieError> {
-        let mut excluded_hashes = vec![];
-        let mut num_messages = 0;
-
-        let mut current_node = self; // traverse from the current node
-        for (i, char) in prefix.iter().enumerate().skip(current_index) {
-            let current_prefix = prefix[0..i].to_vec();
-
-            let (excluded_items, excluded_hash) =
-                current_node.excluded_hash(ctx, db, &current_prefix, *char)?;
-
-            excluded_hashes.push(excluded_hash);
-            num_messages += excluded_items;
-
-            if !current_node.children.contains_key(char) {
-                return Ok(TrieSnapshot {
-                    prefix: current_prefix,
-                    excluded_hashes,
-                    num_messages,
-                });
-            }
-
-            current_node = current_node.get_or_load_child(ctx, db, &current_prefix, *char)?;
-        }
-
-        excluded_hashes.push(hex::encode(current_node.hash().as_slice()));
-
-        Ok(TrieSnapshot {
-            prefix: prefix.to_vec(),
-            excluded_hashes,
-            num_messages,
-        })
     }
 
     // Keeping this around since it is useful for debugging
